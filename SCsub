@@ -1,0 +1,22 @@
+# SCsub
+
+Import('env')
+
+env.add_source_files(env.modules_sources, "*.cpp") # Add all cpp files to the build
+
+# With multiple sources, you can also add each file individually to a Python string list:
+# src_list = ["ydrawing.cpp", "other.cpp", "etc.cpp"]
+# env.add_source_files(env.modules_sources, src_list)
+
+# This allows for powerful possibilities using Python to construct the file list using loops and logic statements. 
+# Look at some modules that ship with Godot by default for examples.
+
+# To add include directories for the compiler to look at you can append it to the environment's paths:
+# env.Append(CPPPATH=["mylib/include"]) # this is a relative path
+# env.Append(CPPPATH=["#myotherlib/include"]) # this is an 'absolute' path
+
+# If you want to add custom compiler flags when building your module, you need to clone env first, 
+# so it won't add those flags to whole Godot build (which can cause errors). Example SCsub with custom flags:
+# module_env = env.Clone()
+# module_env.add_source_files(env.modules_sources, "*.cpp")
+# module_env.Append(CCFLAGS=['-O2'])
