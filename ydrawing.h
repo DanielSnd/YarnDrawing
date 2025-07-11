@@ -214,6 +214,9 @@ public:
 	void set_record_during_playback(bool p_record_during_playback) { record_during_playback = p_record_during_playback; }
 	bool get_record_during_playback() const { return record_during_playback; }
 	
+	bool is_skipping_playback = false;
+	void skip_playback_to_end();
+
 	// Recording and playback
 	PackedByteArray get_recorded_events() const;
 	PackedByteArray get_playing_back_events() const;

@@ -72,6 +72,8 @@ void YDrawing::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_playing_back_events"), &YDrawing::get_playing_back_events);
 	ClassDB::bind_method(D_METHOD("clear_playing_back_events"), &YDrawing::clear_playing_back_events);
 
+	ClassDB::bind_method(D_METHOD("skip_playback_to_end"), &YDrawing::skip_playback_to_end);
+
 	ClassDB::bind_method(D_METHOD("set_record_during_playback", "record_during_playback"), &YDrawing::set_record_during_playback);
 	ClassDB::bind_method(D_METHOD("get_record_during_playback"), &YDrawing::get_record_during_playback);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "record_during_playback"), "set_record_during_playback", "get_record_during_playback");
@@ -104,7 +106,6 @@ void YDrawing::_bind_methods() {
 	ADD_SIGNAL(MethodInfo(SNAME("created_snapshot")));
 	ADD_SIGNAL(MethodInfo(SNAME("callback_event"), PropertyInfo(Variant::VECTOR2, "position")));
 }
-
 
 Size2 YDrawing::get_minimum_size() const {
 	if (canvas_texture.is_valid()) {
@@ -1201,16 +1202,16 @@ void YDrawing::stop_playback() {
 }
 
 void YDrawing::process_playback_events() {
-	// Simplified playback - just process all events immediately
 	if (!is_playback_active || playing_back_events.size() == 0 || playback_index >= playing_back_events.size()) {
 		stop_playback();
+		is_skipping_playback = false;
 		return;
 	}
     current_playback_time += get_process_delta_time() * playback_speed;
 
     if (playback_index < playing_back_events.size()) {
         const DrawingEvent &event = playing_back_events[playback_index];
-		if (playback_with_pauses && event.timestamp > current_playback_time) {
+		if (!is_skipping_playback && (playback_with_pauses && event.timestamp > current_playback_time)) {
 			return;
 		}
         //print_line(vformat("Playing back event: %d at index %d and position %s", event.type, playback_index, event.position));
@@ -1256,6 +1257,9 @@ void YDrawing::process_playback_events() {
 				break;
         }
         playback_index++;
+		if (is_skipping_playback) {
+			process_playback_events();
+		}
     }
 }
 
@@ -1284,11 +1288,15 @@ void YDrawing::create_snapshot() {
 	
 	PackedByteArray snapshot = compress_image(canvas_image);
 	snapshot_buffer.push_back(snapshot);
-	print_line(vformat("Created snapshot at index %d", snapshot_buffer.size() - 1));
+	// print_line(vformat("Created snapshot at index %d", snapshot_buffer.size() - 1));
 	// Add to undo stack
 	undo_stack.push_back(snapshot_buffer.size() - 1);
 
 	emit_signal(SNAME("created_snapshot"));
+}
+
+void YDrawing::skip_playback_to_end() {
+	is_skipping_playback = true;
 }
 
 void YDrawing::apply_snapshot(const PackedByteArray &snapshot) {
