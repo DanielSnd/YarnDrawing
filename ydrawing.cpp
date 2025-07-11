@@ -99,6 +99,9 @@ void YDrawing::_bind_methods() {
 	ADD_SIGNAL(MethodInfo(SNAME("stroke_started"), PropertyInfo(Variant::COLOR, "color"), PropertyInfo(Variant::FLOAT, "brush_size")));
 	ADD_SIGNAL(MethodInfo(SNAME("stroke_ended")));
 	ADD_SIGNAL(MethodInfo(SNAME("playback_finished")));
+	ADD_SIGNAL(MethodInfo(SNAME("executed_undo")));
+	ADD_SIGNAL(MethodInfo(SNAME("executed_redo")));
+	ADD_SIGNAL(MethodInfo(SNAME("created_snapshot")));
 	ADD_SIGNAL(MethodInfo(SNAME("callback_event"), PropertyInfo(Variant::VECTOR2, "position")));
 }
 
@@ -1284,6 +1287,8 @@ void YDrawing::create_snapshot() {
 	print_line(vformat("Created snapshot at index %d", snapshot_buffer.size() - 1));
 	// Add to undo stack
 	undo_stack.push_back(snapshot_buffer.size() - 1);
+
+	emit_signal(SNAME("created_snapshot"));
 }
 
 void YDrawing::apply_snapshot(const PackedByteArray &snapshot) {
@@ -1334,6 +1339,7 @@ void YDrawing::undo() {
         if (previous_snapshot_index >= 0 && previous_snapshot_index < snapshot_buffer.size()) {
             apply_snapshot(snapshot_buffer[previous_snapshot_index]);
         }
+		emit_signal(SNAME("executed_undo"));
     }
 }
 
@@ -1351,6 +1357,7 @@ void YDrawing::redo() {
             undo_stack.push_back(snapshot_index);
             apply_snapshot(snapshot_buffer[snapshot_index]);
         }
+		emit_signal(SNAME("executed_redo"));
     }
 }
 
