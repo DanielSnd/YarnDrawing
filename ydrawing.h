@@ -8,30 +8,41 @@
 #include "core/math/color.h"
 #include "core/variant/array.h"
 #include "core/variant/variant.h"
-#include "core/input/input_event.h"
 #include "core/math/math_funcs.h"
 #include "core/math/geometry_2d.h"
 #include "core/io/image_loader.h"
-#include "scene/main/viewport.h"
-#include "scene/main/canvas_layer.h"
-#include "scene/main/scene_tree.h"
 #include "scene/resources/image_texture.h"
 #include "servers/rendering_server.h"
+#include "scene/gui/texture_rect.h"
+#include "core/io/marshalls.h"
 
 class YDrawing : public Control {
 	GDCLASS(YDrawing, Control);
 
 public:
+	TextureRect::ExpandMode expand_mode = TextureRect::EXPAND_KEEP_SIZE;
+	TextureRect::StretchMode stretch_mode = TextureRect::STRETCH_SCALE;
+
 	enum EventType {
-		STROKE_START,
-		STROKE_POINT,
-		STROKE_END,
-		ERASE_START,
-		ERASE_POINT,
-		ERASE_END,
-		CLEAR_CANVAS
+		STROKE_START = 0,
+		STROKE_START_CHANGED = 1,
+		STROKE_POINT = 2,
+		STROKE_END = 3,
+		ERASE_START = 4,
+		ERASE_START_CHANGED = 5,
+		ERASE_POINT = 6,
+		ERASE_END = 7,
+		CLEAR_CANVAS = 8,
+		CALLBACK_EVENT = 9
 	};
 	
+
+	void set_expand_mode(TextureRect::ExpandMode p_mode);
+	TextureRect::ExpandMode get_expand_mode() const;
+
+	void set_stretch_mode(TextureRect::StretchMode p_mode);
+	TextureRect::StretchMode get_stretch_mode() const;
+
 	struct DrawingEvent {
 		EventType type;
 		float timestamp;
@@ -51,11 +62,13 @@ private:
 	bool smoothing_enabled;
 	float smoothing_strength;
 	bool recording_enabled;
+	
+	Color last_stroke_color;
+	float last_stroke_size;
+	float last_erase_size;
 
 	// Drawing state
 	Ref<Image> canvas_image;
-	Ref<Image> stroke_buffer;
-	Ref<Image> canvas_state_before_stroke;
 	Ref<ImageTexture> canvas_texture;
 	bool is_drawing;
 	bool is_erasing;
@@ -66,13 +79,15 @@ private:
 	
 	// Event recording
 	Vector<DrawingEvent> recorded_events;
+	Vector<DrawingEvent> playing_back_events;
 	bool is_playback_active;
+	bool playback_with_pauses = false;
 	float playback_speed;
+	float current_playback_time;
 	int playback_index;
 	
 	// Undo system
 	Vector<PackedByteArray> snapshot_buffer;
-	Vector<uint8_t> incremental_strokes;
 
 	Vector2 last_stroke_point;
 	Vector<int> undo_stack;
@@ -80,7 +95,6 @@ private:
 	int max_undo_steps;
 	
 	// Performance optimization
-	Rect2i dirty_rect;
 	bool needs_update;
 
 	bool use_background_color = false;
@@ -110,8 +124,8 @@ private:
 	void record_clear_canvas();
 	
 	// Serialization helpers
-	PackedByteArray serialize_events() const;
-	bool deserialize_events(const PackedByteArray &data);
+	PackedByteArray serialize_events(const Vector<DrawingEvent> &events_to_serialize) const;
+	bool deserialize_events(const PackedByteArray &data, Vector<DrawingEvent> &events_destination);
 	
 	// Undo system helpers
 	void create_snapshot();
@@ -121,22 +135,25 @@ private:
 	
 	// Playback helpers
 	void process_playback_events();
-	float get_next_event_timestamp();
 	
 	// Utility functions
 	bool is_point_valid(const Vector2 &point) const;
-	void update_dirty_rect(const Vector2 &point, float radius);
 	void update_canvas_texture();
 	void set_dirty() {needs_update = true;}
 protected:
 	static void _bind_methods();
 	void _notification(int p_what);
-	void _gui_input(const Ref<InputEvent> &p_event);
 
+	virtual Size2 get_minimum_size() const override;
 public:
 	YDrawing();
 	~YDrawing();
-	
+
+	bool counting_time = false;
+	float current_time = 0.0f;
+
+	void reset_counting_time() { counting_time = false; current_time = 0.0f; }
+
 	// Properties
 	void set_canvas_size(const Vector2i &p_size);
 	Vector2i get_canvas_size() const;
@@ -182,8 +199,6 @@ public:
 	float point_to_line_distance(const Vector2 &point, const Vector2 &line_start, const Vector2 &line_end);
 	Vector2 catmull_rom_interpolate(const Vector2 &p0, const Vector2 &p1, const Vector2 &p2, const Vector2 &p3, float t);
 
-	int last_drawn_count = 0;
-	Vector<Vector2> last_drawn_smoothed_points;
 	void draw_stroke_incremental(const Vector<Vector2> &current_smoothed_points);
 	void start_erase(const Vector2 &position);
 	void add_erase_point(const Vector2 &position);
@@ -191,22 +206,26 @@ public:
 	
 	void clear_canvas();
 
-	bool auto_handle_input = true;
-	void set_auto_handle_input(bool p_auto_handle_input) { auto_handle_input = p_auto_handle_input; }
-	bool get_auto_handle_input() const { return auto_handle_input; }
+	bool record_during_playback = false;
+	void set_record_during_playback(bool p_record_during_playback) { record_during_playback = p_record_during_playback; }
+	bool get_record_during_playback() const { return record_during_playback; }
 	
 	// Recording and playback
 	PackedByteArray get_recorded_events() const;
-	void playback_events(const PackedByteArray &event_data, float speed_multiplier = 1.0f);
+	PackedByteArray get_playing_back_events() const;
+	void playback_events(const PackedByteArray &event_data, float speed_multiplier = 1.0f, bool include_pauses = false);
 	bool is_playing_back() const;
 	void stop_playback();
 	void clear_recorded_events();
+	void clear_playing_back_events();
+	void add_callback_event(const Vector2 &position);
 	
+	bool should_record_event() const;
+
 	// Undo/Redo
 	void undo();
 	void redo();
 	PackedByteArray get_snapshot_buffer() const;
-	PackedByteArray get_incremental_strokes() const;
 	PackedByteArray get_undo_stack() const;
 	PackedByteArray get_redo_stack() const;
 	void clear_undo_stack();

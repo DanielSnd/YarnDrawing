@@ -1,6 +1,14 @@
 #include "ydrawing.h"
 
 void YDrawing::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_expand_mode", "expand_mode"), &YDrawing::set_expand_mode);
+	ClassDB::bind_method(D_METHOD("get_expand_mode"), &YDrawing::get_expand_mode);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "expand_mode", PROPERTY_HINT_ENUM, "Keep Size,Ignore Size,Fit Width,Fit Width Proportional,Fit Height,Fit Height Proportional"), "set_expand_mode", "get_expand_mode");
+
+	ClassDB::bind_method(D_METHOD("set_stretch_mode", "stretch_mode"), &YDrawing::set_stretch_mode);
+	ClassDB::bind_method(D_METHOD("get_stretch_mode"), &YDrawing::get_stretch_mode);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "stretch_mode", PROPERTY_HINT_ENUM, "Scale,Tile,Keep,Keep Centered,Keep Aspect,Keep Aspect Centered,Keep Aspect Covered"), "set_stretch_mode", "get_stretch_mode");
+
 	ClassDB::bind_method(D_METHOD("set_canvas_size", "size"), &YDrawing::set_canvas_size, DEFVAL(Vector2i(600, 800)));
 	ClassDB::bind_method(D_METHOD("get_canvas_size"), &YDrawing::get_canvas_size);
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2I, "canvas_size"), "set_canvas_size", "get_canvas_size");
@@ -25,10 +33,6 @@ void YDrawing::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_recording_enabled"), &YDrawing::get_recording_enabled);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "recording_enabled"), "set_recording_enabled", "get_recording_enabled");
 	
-	ClassDB::bind_method(D_METHOD("set_auto_handle_input", "auto_handle_input"), &YDrawing::set_auto_handle_input);
-	ClassDB::bind_method(D_METHOD("get_auto_handle_input"), &YDrawing::get_auto_handle_input);
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_handle_input"), "set_auto_handle_input", "get_auto_handle_input");
-
     ClassDB::bind_method(D_METHOD("set_current_color", "color"), &YDrawing::set_current_color);
 	ClassDB::bind_method(D_METHOD("get_current_color"), &YDrawing::get_current_color);
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "current_color"), "set_current_color", "get_current_color");
@@ -60,15 +64,24 @@ void YDrawing::_bind_methods() {
 	// Recording and playback
 	ClassDB::bind_method(D_METHOD("get_recorded_events"), &YDrawing::get_recorded_events);
     ClassDB::bind_method(D_METHOD("clear_recorded_events"), &YDrawing::clear_recorded_events);
-	ClassDB::bind_method(D_METHOD("playback_events", "event_data", "speed_multiplier"), &YDrawing::playback_events);
+	ClassDB::bind_method(D_METHOD("playback_events", "event_data", "speed_multiplier", "include_pauses"), &YDrawing::playback_events, DEFVAL(1.0f), DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("is_playing_back"), &YDrawing::is_playing_back);
 	ClassDB::bind_method(D_METHOD("stop_playback"), &YDrawing::stop_playback);
 	
+	ClassDB::bind_method(D_METHOD("add_callback_event", "position"), &YDrawing::add_callback_event);
+	ClassDB::bind_method(D_METHOD("get_playing_back_events"), &YDrawing::get_playing_back_events);
+	ClassDB::bind_method(D_METHOD("clear_playing_back_events"), &YDrawing::clear_playing_back_events);
+
+	ClassDB::bind_method(D_METHOD("set_record_during_playback", "record_during_playback"), &YDrawing::set_record_during_playback);
+	ClassDB::bind_method(D_METHOD("get_record_during_playback"), &YDrawing::get_record_during_playback);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "record_during_playback"), "set_record_during_playback", "get_record_during_playback");
+
+	ClassDB::bind_method(D_METHOD("reset_counting_time"), &YDrawing::reset_counting_time);
+
 	// Undo/Redo
 	ClassDB::bind_method(D_METHOD("undo"), &YDrawing::undo);
 	ClassDB::bind_method(D_METHOD("redo"), &YDrawing::redo);
 	ClassDB::bind_method(D_METHOD("get_snapshot_buffer"), &YDrawing::get_snapshot_buffer);
-	ClassDB::bind_method(D_METHOD("get_incremental_strokes"), &YDrawing::get_incremental_strokes);
 	ClassDB::bind_method(D_METHOD("get_undo_stack"), &YDrawing::get_undo_stack);
 	ClassDB::bind_method(D_METHOD("get_redo_stack"), &YDrawing::get_redo_stack);
 	ClassDB::bind_method(D_METHOD("clear_undo_stack"), &YDrawing::clear_undo_stack);
@@ -81,14 +94,71 @@ void YDrawing::_bind_methods() {
 
     ClassDB::bind_method(D_METHOD("set_dirty"), &YDrawing::set_dirty);
 	// Signals
-	ADD_SIGNAL(MethodInfo("stroke_started", PropertyInfo(Variant::COLOR, "color"), PropertyInfo(Variant::FLOAT, "brush_size")));
-	ADD_SIGNAL(MethodInfo("stroke_ended"));
-	ADD_SIGNAL(MethodInfo("playback_finished"));
+	ADD_SIGNAL(MethodInfo(SNAME("stroke_started"), PropertyInfo(Variant::COLOR, "color"), PropertyInfo(Variant::FLOAT, "brush_size")));
+	ADD_SIGNAL(MethodInfo(SNAME("stroke_ended")));
+	ADD_SIGNAL(MethodInfo(SNAME("playback_finished")));
+	ADD_SIGNAL(MethodInfo(SNAME("callback_event"), PropertyInfo(Variant::VECTOR2, "position")));
+}
+
+
+Size2 YDrawing::get_minimum_size() const {
+	if (canvas_texture.is_valid()) {
+		switch (expand_mode) {
+			case TextureRect::EXPAND_KEEP_SIZE: {
+				return canvas_texture->get_size();
+			} break;
+			case TextureRect::EXPAND_IGNORE_SIZE: {
+				return Size2();
+			} break;
+			case TextureRect::EXPAND_FIT_WIDTH: {
+				return Size2(get_size().y, 0);
+			} break;
+			case TextureRect::EXPAND_FIT_WIDTH_PROPORTIONAL: {
+				real_t ratio = real_t(canvas_texture->get_width()) / canvas_texture->get_height();
+				return Size2(get_size().y * ratio, 0);
+			} break;
+			case TextureRect::EXPAND_FIT_HEIGHT: {
+				return Size2(0, get_size().x);
+			} break;
+			case TextureRect::EXPAND_FIT_HEIGHT_PROPORTIONAL: {
+				real_t ratio = real_t(canvas_texture->get_height()) / canvas_texture->get_width();
+				return Size2(0, get_size().x * ratio);
+			} break;
+		}
+	}
+	return Size2();
+}
+
+void YDrawing::set_expand_mode(TextureRect::ExpandMode p_mode) {
+	if (expand_mode == p_mode) {
+		return;
+	}
+
+	expand_mode = p_mode;
+	queue_redraw();
+	update_minimum_size();
+}
+
+TextureRect::ExpandMode YDrawing::get_expand_mode() const {
+	return expand_mode;
+}
+
+void YDrawing::set_stretch_mode(TextureRect::StretchMode p_mode) {
+	if (stretch_mode == p_mode) {
+		return;
+	}
+
+	stretch_mode = p_mode;
+	queue_redraw();
+}
+
+TextureRect::StretchMode YDrawing::get_stretch_mode() const {
+	return stretch_mode;
 }
 
 void YDrawing::_notification(int p_what) {
 	switch (p_what) {
-		case NOTIFICATION_READY:
+		case NOTIFICATION_READY:{
 			// Initialize canvas
 			if (canvas_size == Vector2i()) {
 				canvas_size = Vector2i(600, 800);
@@ -102,59 +172,90 @@ void YDrawing::_notification(int p_what) {
                 set_process_input(true);
                 set_process_unhandled_input(true);
             }
-			break;
+		}
+		break;
 			
 		case NOTIFICATION_DRAW:
-			if (canvas_texture.is_valid()) {
-				draw_texture(canvas_texture, Vector2());
+		{
+			if (canvas_texture.is_null()) {
+				return;
 			}
-			break;
-			
-		case NOTIFICATION_PROCESS:
-			if (is_playback_active) {
-				process_playback_events();
-			}
-			if (needs_update) {
-				update_canvas_texture();
-				needs_update = false;
-			}
-			break;
-	}
-}
 
-void YDrawing::_gui_input(const Ref<InputEvent> &p_event) {
-	// Handle input events for drawing
-	if (is_playback_active) {
-		return; // Don't handle input during playback
-	}
-	
-	if (p_event->is_class("InputEventMouseButton")) {
-		Ref<InputEventMouseButton> mb = p_event;
-		Vector2 pos = mb->get_position();
-		
-		if (mb->get_button_index() == MouseButton::LEFT) {
-			if (mb->is_pressed()) {
-				start_stroke(pos);
-			} else {
-				end_stroke();
+			Size2 size;
+			Point2 offset;
+			Rect2 region;
+			bool tile = false;
+
+			switch (stretch_mode) {
+				case TextureRect::STRETCH_SCALE: {
+					size = get_size();
+				} break;
+				case TextureRect::STRETCH_TILE: {
+					size = get_size();
+					tile = true;
+				} break;
+				case TextureRect::STRETCH_KEEP: {
+					size = canvas_texture->get_size();
+				} break;
+				case TextureRect::STRETCH_KEEP_CENTERED: {
+					offset = (get_size() - canvas_texture->get_size()) / 2;
+					size = canvas_texture->get_size();
+				} break;
+				case TextureRect::STRETCH_KEEP_ASPECT_CENTERED:
+				case TextureRect::STRETCH_KEEP_ASPECT: {
+					size = get_size();
+					int tex_width = canvas_texture->get_width() * size.height / canvas_texture->get_height();
+					int tex_height = size.height;
+
+					if (tex_width > size.width) {
+						tex_width = size.width;
+						tex_height = canvas_texture->get_height() * tex_width / canvas_texture->get_width();
+					}
+
+					if (stretch_mode == TextureRect::STRETCH_KEEP_ASPECT_CENTERED) {
+						offset.x += (size.width - tex_width) / 2;
+						offset.y += (size.height - tex_height) / 2;
+					}
+
+					size.width = tex_width;
+					size.height = tex_height;
+				} break;
+					case TextureRect::STRETCH_KEEP_ASPECT_COVERED: {
+					size = get_size();
+
+					Size2 tex_size = canvas_texture->get_size();
+					Size2 scale_size(size.width / tex_size.width, size.height / tex_size.height);
+					float scale = scale_size.width > scale_size.height ? scale_size.width : scale_size.height;
+					Size2 scaled_tex_size = tex_size * scale;
+
+					region.position = ((scaled_tex_size - size) / scale).abs() / 2.0f;
+					region.size = size / scale;
+				} break;
 			}
-		} else if (mb->get_button_index() == MouseButton::RIGHT) {
-			if (mb->is_pressed()) {
-				start_erase(pos);
-				add_erase_point(pos);
+
+			if (region.has_area()) {
+				draw_texture_rect_region(canvas_texture, Rect2(offset, size), region);
 			} else {
-				end_erase();
+				draw_texture_rect(canvas_texture, Rect2(offset, size), tile);
 			}
-		}
-	} else if (p_event->is_class("InputEventMouseMotion")) {
-		Ref<InputEventMouseMotion> mm = p_event;
-		Vector2 pos = mm->get_position();
-		
-		if (is_drawing) {
-			add_stroke_point(pos);
-		} else if (is_erasing) {
-			add_erase_point(pos);
-		}
+		} break;
+		case NOTIFICATION_RESIZED: {
+			update_minimum_size();
+		} break;
+		case NOTIFICATION_PROCESS:
+			{
+				if (counting_time) {
+					current_time += get_process_delta_time();
+				}
+				if (is_playback_active) {
+					process_playback_events();
+				}
+				if (needs_update) {
+					update_canvas_texture();
+					needs_update = false;
+				}
+			}
+			break;
 	}
 }
 
@@ -182,7 +283,6 @@ YDrawing::YDrawing() {
 YDrawing::~YDrawing() {
 	// Cleanup
     canvas_image = Ref<Image>();
-    canvas_state_before_stroke = Ref<Image>();
     canvas_texture = Ref<ImageTexture>();
 }
 
@@ -192,7 +292,7 @@ void YDrawing::set_canvas_size(const Vector2i &p_size) {
 	if (canvas_image.is_valid()) {
 		canvas_image->resize(canvas_size.x, canvas_size.y);
 		canvas_image->fill(background_color);
-		update_canvas_texture();
+		canvas_texture->set_image(canvas_image);
 	}
 }
 
@@ -243,26 +343,21 @@ void YDrawing::start_stroke_custom(const Vector2 &position, const Color &color, 
     start_stroke(position);
 }
 
+bool YDrawing::should_record_event() const {
+	return recording_enabled && (!is_playback_active || record_during_playback);
+}
+
 void YDrawing::start_stroke(const Vector2 &position) {
 	is_drawing = true;
         
     reset_smoothing();
 	add_smoothing_point(position); // Will be updated with first point
 	
-	if (recording_enabled && !is_playback_active) {
+	if (should_record_event()) {
 		record_stroke_start(position, current_color, current_brush_size);
 	}
-    
-    // Clear stroke buffer for new stroke
-    if (stroke_buffer.is_valid()) {
-        stroke_buffer->fill(Color(0.0f, 0.0f, 0.0f, 0.0f));
-    }
-    
-    // Reset incremental drawing state
-    last_drawn_smoothed_points.clear();
-    last_drawn_count = 0;
 
-	emit_signal("stroke_started", current_color, current_brush_size);
+	emit_signal(SNAME("stroke_started"), current_color, current_brush_size);
 }
 
 void YDrawing::add_stroke_point(const Vector2 &position) {
@@ -277,7 +372,7 @@ void YDrawing::add_stroke_point(const Vector2 &position) {
 
     add_smoothing_point(position);
     
-    if (recording_enabled && !is_playback_active) {
+    if (should_record_event()) {
         record_stroke_point(position);
     }
     
@@ -291,19 +386,15 @@ void YDrawing::end_stroke() {
 	
 	is_drawing = false;
 	
-	if (recording_enabled && !is_playback_active) {
+	if (should_record_event()) {
 		record_stroke_end();
 	}
 	    
-    // Clear incremental state
-    last_drawn_smoothed_points.clear();
-    last_drawn_count = 0;
-
     if (!is_playback_active) {
 	    create_snapshot();
     }
 
-	emit_signal("stroke_ended");
+	emit_signal(SNAME("stroke_ended"));
 }
 
 void YDrawing::start_erase(const Vector2 &position) {
@@ -314,7 +405,7 @@ void YDrawing::start_erase(const Vector2 &position) {
 	reset_smoothing();
 	add_smoothing_point(position); // Will be updated with first point
 	
-	if (recording_enabled && !is_playback_active) {
+	if (should_record_event()) {
 		record_erase_start(position, current_eraser_size);
 	}
 }
@@ -331,7 +422,7 @@ void YDrawing::add_erase_point(const Vector2 &position) {
 
     add_smoothing_point(position);
     
-    if (recording_enabled && !is_playback_active) {
+    if (should_record_event()) {
         record_erase_point(position);
     }
     
@@ -345,7 +436,7 @@ void YDrawing::end_erase() {
 	
 	is_erasing = false;
 	
-	if (recording_enabled && !is_playback_active) {
+	if (should_record_event()) {
 		record_erase_end();
 	}
 	
@@ -360,7 +451,7 @@ void YDrawing::clear_canvas() {
 		needs_update = true;
 	}
 	
-	if (recording_enabled && !is_playback_active) {
+	if (should_record_event()) {
 		record_clear_canvas();
 	}
 	
@@ -519,13 +610,11 @@ void YDrawing::add_smoothing_point(const Vector2 &point) {
         for (int i = 0; i < half_size; i++) {
             smoothing_buffer.remove_at(0);
         }
-        last_drawn_count = last_drawn_count / 2;
 	}
 }
 
 void YDrawing::reset_smoothing() {
 	smoothing_buffer.clear();
-    last_drawn_count = 0;
 }
 Vector<Vector2> YDrawing::get_smoothed_points(float strength) {
     if (smoothing_buffer.size() < 2) return smoothing_buffer;
@@ -568,17 +657,25 @@ Vector2 YDrawing::catmull_rom_interpolate(const Vector2 &p0, const Vector2 &p1, 
     return result;
 }
 
-
 // Event recording
 void YDrawing::record_event(EventType type, const Vector2 &position, const Color &color, float size) {
 	if (!recording_enabled) return;
-	
-	DrawingEvent event(type, 0.0f, position, color, size);
+	if (recorded_events.size() == 0) {
+		counting_time = true;
+		current_time = 0.0f;
+	}
+	DrawingEvent event(type, current_time, position, color, size);
 	recorded_events.append(event);
 }
 
 void YDrawing::record_stroke_start(const Vector2 &position, const Color &color, float brush_size) {
-	record_event(STROKE_START, position, color, brush_size);
+	if (last_stroke_color != color || last_stroke_size - brush_size > 0.001f) {
+		record_event(STROKE_START_CHANGED, position, color, brush_size);
+		last_stroke_color = color;
+		last_stroke_size = brush_size;
+	} else {
+		record_event(STROKE_START, position, color, brush_size);
+	}
 }
 
 void YDrawing::record_stroke_point(const Vector2 &position) {
@@ -590,7 +687,12 @@ void YDrawing::record_stroke_end() {
 }
 
 void YDrawing::record_erase_start(const Vector2 &position, float eraser_size) {
-	record_event(ERASE_START, position, Color(), eraser_size);
+	if (last_erase_size - eraser_size > 0.001f) {
+		record_event(ERASE_START_CHANGED, position, background_color, eraser_size);
+		last_erase_size = eraser_size;
+	} else {
+		record_event(ERASE_START, position, background_color, eraser_size);
+	}
 }
 
 void YDrawing::record_erase_point(const Vector2 &position) {
@@ -606,85 +708,98 @@ void YDrawing::record_clear_canvas() {
 }
 
 // Serialization helpers
-PackedByteArray YDrawing::serialize_events() const {
+PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to_serialize) const {
 	PackedByteArray result;
-	
+
+	// Calculate total size needed, starting with the event count (4 bytes)
+	int calculate_total_size = 0;
+	calculate_total_size += sizeof(int); // event count
+	for (int i = 0; i < events_to_serialize.size(); i++) {
+		const DrawingEvent &event = events_to_serialize[i];
+		calculate_total_size += sizeof(uint8_t) + sizeof(float); // type + timestamp (always present)
+		if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+			calculate_total_size += sizeof(float) * 7; // position (2) + color (4) + size (1)
+		} else if (event.type == STROKE_POINT || event.type == ERASE_POINT || event.type == CALLBACK_EVENT || event.type == STROKE_START || event.type == ERASE_START) {
+			calculate_total_size += sizeof(float) * 2; // position (2)
+		}
+	}
+	result.resize(calculate_total_size);
+
 	// Write event count
-	int event_count = recorded_events.size();
-	result.resize(sizeof(int));
-	memcpy(result.ptrw(), &event_count, sizeof(int));
-	
-	// Write each event
-	for (int i = 0; i < recorded_events.size(); i++) {
-		const DrawingEvent &event = recorded_events[i];
-		int current_size = result.size();
-		result.resize(current_size + sizeof(EventType) + sizeof(float) * 8);
-		
-		uint8_t *ptr = result.ptrw() + current_size;
-		memcpy(ptr, &event.type, sizeof(EventType));
-		ptr += sizeof(EventType);
-		memcpy(ptr, &event.timestamp, sizeof(float));
-		ptr += sizeof(float);
-		memcpy(ptr, &event.position.x, sizeof(float));
-		ptr += sizeof(float);
-		memcpy(ptr, &event.position.y, sizeof(float));
-		ptr += sizeof(float);
-		memcpy(ptr, &event.color.r, sizeof(float));
-		ptr += sizeof(float);
-		memcpy(ptr, &event.color.g, sizeof(float));
-		ptr += sizeof(float);
-		memcpy(ptr, &event.color.b, sizeof(float));
-		ptr += sizeof(float);
-		memcpy(ptr, &event.color.a, sizeof(float));
-		ptr += sizeof(float);
-		memcpy(ptr, &event.size, sizeof(float));
+	int offset = encode_uint32(events_to_serialize.size(), &result.write[0]); // 4
+	for (int i = 0; i < events_to_serialize.size(); i++) {
+		const DrawingEvent &event = events_to_serialize[i];
+
+		result.write[offset] = static_cast<uint8_t>(event.type); // Write Type, 1 byte
+		offset += sizeof(uint8_t);
+
+		offset += encode_float(event.timestamp, &result.write[offset]); // Write timestamp, 4 bytes
+		if (event.type == STROKE_POINT || event.type == ERASE_POINT ||
+			event.type == CALLBACK_EVENT || event.type == STROKE_START ||
+			event.type == ERASE_START || event.type == STROKE_START_CHANGED ||
+			event.type == ERASE_START_CHANGED) {
+			offset += encode_float(event.position.x, &result.write[offset]); // Write position, 4 bytes
+			offset += encode_float(event.position.y, &result.write[offset]); // Write position, 4 bytes
+		} 
+		if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+			offset += encode_float(event.color.r, &result.write[offset]); // Write color Red, 4 bytes
+			offset += encode_float(event.color.g, &result.write[offset]); // Write color Green, 4 bytes
+			offset += encode_float(event.color.b, &result.write[offset]); // Write color Blue, 4 bytes
+			result.write[offset] = static_cast<uint8_t>(std::round(event.size)); // Write brush size, 1 byte
+			offset += sizeof(uint8_t);
+		}
+		// For STROKE_END, ERASE_END, CLEAR_CANVAS, no additional data needed
 	}
 	
 	return result;
 }
 
-bool YDrawing::deserialize_events(const PackedByteArray &data) {
+bool YDrawing::deserialize_events(const PackedByteArray &data, Vector<DrawingEvent> &events_destination) {
 	if (data.size() < sizeof(int)) return false;
 	
-	recorded_events.clear();
+	events_destination.clear();
 	
+    const uint8_t *ptr = data.ptr();
+
+    // type = static_cast<MessageType>(ptr[0]);
+    // channel = ptr[1];
+    // reliability = ptr[2];
+    // targetClientId = decode_uint32(ptr + 3);
+    // packetData.resize(decode_uint32(ptr + 7));
+    // memcpy(packetData.ptrw(), &p_data[11], packetData.size());
+
 	// Read event count
-	int event_count;
-	memcpy(&event_count, data.ptr(), sizeof(int));
+	int event_count = decode_uint32(ptr);
+	int offset = sizeof(uint32_t);
 	
-	int offset = sizeof(int);
-	
-	// Read each event
 	for (int i = 0; i < event_count; i++) {
-		if (offset + sizeof(EventType) + sizeof(float) * 8 > data.size()) return false;
-		
 		DrawingEvent event;
-		memcpy(&event.type, data.ptr() + offset, sizeof(EventType));
-		offset += sizeof(EventType);
-		
-		memcpy(&event.timestamp, data.ptr() + offset, sizeof(float));
+		event.type = static_cast<EventType>(ptr[offset]);
+		offset += sizeof(uint8_t);
+		event.timestamp = decode_float(ptr + offset);
 		offset += sizeof(float);
-		
-		memcpy(&event.position.x, data.ptr() + offset, sizeof(float));
-		offset += sizeof(float);
-		memcpy(&event.position.y, data.ptr() + offset, sizeof(float));
-		offset += sizeof(float);
-		
-		memcpy(&event.color.r, data.ptr() + offset, sizeof(float));
-		offset += sizeof(float);
-		memcpy(&event.color.g, data.ptr() + offset, sizeof(float));
-		offset += sizeof(float);
-		memcpy(&event.color.b, data.ptr() + offset, sizeof(float));
-		offset += sizeof(float);
-		memcpy(&event.color.a, data.ptr() + offset, sizeof(float));
-		offset += sizeof(float);
-		
-		memcpy(&event.size, data.ptr() + offset, sizeof(float));
-		offset += sizeof(float);
-		
-		recorded_events.append(event);
+		if (event.type == STROKE_POINT || event.type == ERASE_POINT ||
+			event.type == CALLBACK_EVENT || event.type == STROKE_START ||
+			event.type == ERASE_START || event.type == STROKE_START_CHANGED ||
+			event.type == ERASE_START_CHANGED) {
+			event.position.x = decode_float(ptr + offset);
+			offset += sizeof(float);
+			event.position.y = decode_float(ptr + offset);
+			offset += sizeof(float);
+		}
+		if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+			event.color.r = decode_float(ptr + offset);
+			offset += sizeof(float);
+			event.color.g = decode_float(ptr + offset);
+			offset += sizeof(float);
+			event.color.b = decode_float(ptr + offset);
+			offset += sizeof(float);
+			event.color.a = 1.0f;
+			event.size = static_cast<float>(ptr[offset]);
+			offset += sizeof(uint8_t);
+		}
+		events_destination.push_back(event);
 	}
-	
 	return true;
 }
 
@@ -823,18 +938,31 @@ float YDrawing::point_to_line_distance(const Vector2 &point, const Vector2 &line
 
 // Recording and playback
 PackedByteArray YDrawing::get_recorded_events() const {
-	return serialize_events();
+	return serialize_events(recorded_events);
+}
+PackedByteArray YDrawing::get_playing_back_events() const {
+	return serialize_events(playing_back_events);
+}
+
+void YDrawing::clear_playing_back_events() {
+	playing_back_events.clear();
 }
 
 void YDrawing::clear_recorded_events() {
 	recorded_events.clear();
 }
 
-void YDrawing::playback_events(const PackedByteArray &event_data, float speed_multiplier) {
+void YDrawing::add_callback_event(const Vector2 &position) {
+	record_event(CALLBACK_EVENT, position);
+}
+
+void YDrawing::playback_events(const PackedByteArray &event_data, float speed_multiplier, bool include_pauses) {
 	// Deserialize events and start playback
-	if (deserialize_events(event_data)) {
+	if (deserialize_events(event_data, playing_back_events)) {
 		is_playback_active = true;
+		current_playback_time = 0.0f;
 		playback_speed = speed_multiplier;
+		playback_with_pauses = include_pauses;
 		playback_index = 0;
 		// Clear canvas for playback
 		clear_canvas();
@@ -847,22 +975,33 @@ bool YDrawing::is_playing_back() const {
 
 void YDrawing::stop_playback() {
 	is_playback_active = false;
-	emit_signal("playback_finished");
+	emit_signal(SNAME("playback_finished"));
 }
 
 void YDrawing::process_playback_events() {
 	// Simplified playback - just process all events immediately
-	if (!is_playback_active || recorded_events.size() == 0 || playback_index >= recorded_events.size()) {
+	if (!is_playback_active || playing_back_events.size() == 0 || playback_index >= playing_back_events.size()) {
 		stop_playback();
 		return;
 	}
-    
-    if (playback_index < recorded_events.size()) {
-        const DrawingEvent &event = recorded_events[playback_index];
-        print_line(vformat("Playing back event: %d at index %d and position %s", event.type, playback_index, event.position));
+    current_playback_time += get_process_delta_time() * playback_speed;
+
+    if (playback_index < playing_back_events.size()) {
+        const DrawingEvent &event = playing_back_events[playback_index];
+		if (playback_with_pauses && event.timestamp > current_playback_time) {
+			return;
+		}
+        //print_line(vformat("Playing back event: %d at index %d and position %s", event.type, playback_index, event.position));
         switch (event.type) {
+			case STROKE_START_CHANGED:
+				start_stroke_custom(event.position, event.color, event.size);
+				break;
+			case ERASE_START_CHANGED:
+				current_eraser_size = event.size;
+				start_erase(event.position);
+				break;
             case STROKE_START:
-                start_stroke_custom(event.position, event.color, event.size);
+                start_stroke(event.position);
                 break;
             case STROKE_POINT:
                 add_stroke_point(event.position);
@@ -882,14 +1021,12 @@ void YDrawing::process_playback_events() {
             case CLEAR_CANVAS:
                 clear_canvas();
                 break;
+            case CALLBACK_EVENT:
+				emit_signal(SNAME("callback_event"), event.position);
+				break;
         }
         playback_index++;
     }
-}
-
-float YDrawing::get_next_event_timestamp() {
-	// Simplified - return 0 for immediate playback
-	return 0.0f;
 }
 
 // Undo system
@@ -959,13 +1096,6 @@ PackedByteArray YDrawing::get_snapshot_buffer() const {
 	return result;
 }
 
-PackedByteArray YDrawing::get_incremental_strokes() const {
-	PackedByteArray result;
-	result.resize(incremental_strokes.size());
-	memcpy(result.ptrw(), incremental_strokes.ptr(), incremental_strokes.size());
-	return result;
-}
-
 PackedByteArray YDrawing::get_undo_stack() const {
 	PackedByteArray result;
 	result.resize(undo_stack.size() * sizeof(int));
@@ -993,18 +1123,9 @@ bool YDrawing::is_point_valid(const Vector2 &point) const {
 	return point.x >= 0 && point.x < canvas_size.x && point.y >= 0 && point.y < canvas_size.y;
 }
 
-void YDrawing::update_dirty_rect(const Vector2 &point, float radius) {
-	Rect2i point_rect(point.x - radius, point.y - radius, radius * 2, radius * 2);
-	if (dirty_rect == Rect2i()) {
-		dirty_rect = point_rect;
-	} else {
-		dirty_rect = dirty_rect.merge(point_rect);
-	}
-}
-
 void YDrawing::update_canvas_texture() {
 	if (canvas_texture.is_valid() && canvas_image.is_valid()) {
-		canvas_texture->set_image(canvas_image);
+		canvas_texture->update(canvas_image);
 		queue_redraw();
 	}
 }
