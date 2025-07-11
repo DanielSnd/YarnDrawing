@@ -81,6 +81,8 @@ void YDrawing::_bind_methods() {
 	// Undo/Redo
 	ClassDB::bind_method(D_METHOD("undo"), &YDrawing::undo);
 	ClassDB::bind_method(D_METHOD("redo"), &YDrawing::redo);
+	ClassDB::bind_method(D_METHOD("can_undo"), &YDrawing::can_undo);
+	ClassDB::bind_method(D_METHOD("can_redo"), &YDrawing::can_redo);
 	ClassDB::bind_method(D_METHOD("get_snapshot_buffer"), &YDrawing::get_snapshot_buffer);
 	ClassDB::bind_method(D_METHOD("get_undo_stack"), &YDrawing::get_undo_stack);
 	ClassDB::bind_method(D_METHOD("get_redo_stack"), &YDrawing::get_redo_stack);
@@ -168,6 +170,7 @@ void YDrawing::_notification(int p_what) {
 			
 			canvas_texture = ImageTexture::create_from_image(canvas_image);
             if (!Engine::get_singleton()->is_editor_hint()) {
+				create_snapshot();
                 set_process(true);
                 set_process_input(true);
                 set_process_unhandled_input(true);
@@ -349,7 +352,7 @@ bool YDrawing::should_record_event() const {
 
 void YDrawing::start_stroke(const Vector2 &position) {
 	is_drawing = true;
-        
+
     reset_smoothing();
 	add_smoothing_point(position); // Will be updated with first point
 	
@@ -389,10 +392,8 @@ void YDrawing::end_stroke() {
 	if (should_record_event()) {
 		record_stroke_end();
 	}
-	    
-    if (!is_playback_active) {
-	    create_snapshot();
-    }
+
+	create_snapshot();
 
 	emit_signal(SNAME("stroke_ended"));
 }
@@ -435,13 +436,11 @@ void YDrawing::end_erase() {
 	if (!is_erasing) return;
 	
 	is_erasing = false;
+
+	create_snapshot();
 	
 	if (should_record_event()) {
 		record_erase_end();
-	}
-	
-	if (!is_playback_active) {
-		create_snapshot();
 	}
 }
 
@@ -454,10 +453,8 @@ void YDrawing::clear_canvas() {
 	if (should_record_event()) {
 		record_clear_canvas();
 	}
-	
-	if (!is_playback_active) {
-		create_snapshot();
-	}
+
+	create_snapshot();
 }
 
 // Stroke rendering helpers
@@ -710,97 +707,316 @@ void YDrawing::record_clear_canvas() {
 // Serialization helpers
 PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to_serialize) const {
 	PackedByteArray result;
-
-	// Calculate total size needed, starting with the event count (4 bytes)
-	int calculate_total_size = 0;
-	calculate_total_size += sizeof(int); // event count
-	for (int i = 0; i < events_to_serialize.size(); i++) {
-		const DrawingEvent &event = events_to_serialize[i];
-		calculate_total_size += sizeof(uint8_t) + sizeof(float); // type + timestamp (always present)
-		if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
-			calculate_total_size += sizeof(float) * 7; // position (2) + color (4) + size (1)
-		} else if (event.type == STROKE_POINT || event.type == ERASE_POINT || event.type == CALLBACK_EVENT || event.type == STROKE_START || event.type == ERASE_START) {
-			calculate_total_size += sizeof(float) * 2; // position (2)
-		}
-	}
-	result.resize(calculate_total_size);
-
-	// Write event count
-	int offset = encode_uint32(events_to_serialize.size(), &result.write[0]); // 4
-	for (int i = 0; i < events_to_serialize.size(); i++) {
-		const DrawingEvent &event = events_to_serialize[i];
-
-		result.write[offset] = static_cast<uint8_t>(event.type); // Write Type, 1 byte
-		offset += sizeof(uint8_t);
-
-		offset += encode_float(event.timestamp, &result.write[offset]); // Write timestamp, 4 bytes
-		if (event.type == STROKE_POINT || event.type == ERASE_POINT ||
-			event.type == CALLBACK_EVENT || event.type == STROKE_START ||
-			event.type == ERASE_START || event.type == STROKE_START_CHANGED ||
-			event.type == ERASE_START_CHANGED) {
-			offset += encode_float(event.position.x, &result.write[offset]); // Write position, 4 bytes
-			offset += encode_float(event.position.y, &result.write[offset]); // Write position, 4 bytes
-		} 
-		if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
-			offset += encode_float(event.color.r, &result.write[offset]); // Write color Red, 4 bytes
-			offset += encode_float(event.color.g, &result.write[offset]); // Write color Green, 4 bytes
-			offset += encode_float(event.color.b, &result.write[offset]); // Write color Blue, 4 bytes
-			result.write[offset] = static_cast<uint8_t>(std::round(event.size)); // Write brush size, 1 byte
-			offset += sizeof(uint8_t);
-		}
-		// For STROKE_END, ERASE_END, CLEAR_CANVAS, no additional data needed
-	}
 	
-	return result;
+
+	// First pass: build color palette and calculate size
+    HashMap<Color, uint8_t> color_palette;
+    Vector<Color> unique_colors;
+    
+    for (const DrawingEvent &event : events_to_serialize) {
+        if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+            if (!color_palette.has(event.color)) {
+                color_palette[event.color] = unique_colors.size();
+                unique_colors.push_back(event.color);
+            }
+        }
+    }
+    
+    // Calculate total size
+    int calculate_total_size = 2; // I start with a version byte and I use a 255 byte in the place of an event type to mark the end of the data
+    calculate_total_size += sizeof(uint32_t); // event count
+    calculate_total_size += sizeof(uint8_t); // color palette size
+    calculate_total_size += unique_colors.size() * sizeof(float) * 3; // color palette (RGB)
+    
+    for (int i = 0; i < events_to_serialize.size(); i++) {
+        const DrawingEvent &event = events_to_serialize[i];
+        calculate_total_size += sizeof(uint8_t) + sizeof(uint16_t); // type + scaled timestamp
+        
+        if (event.type == STROKE_START || event.type == ERASE_START) {
+            calculate_total_size += sizeof(uint16_t) * 2; // position as uint16
+            
+            // Count consecutive stroke points
+            int point_count = 0;
+            for (int j = i + 1; j < events_to_serialize.size(); j++) {
+                if (events_to_serialize[j].type == STROKE_POINT || events_to_serialize[j].type == ERASE_POINT) {
+                    point_count++;
+                } else {
+                    break;
+                }
+            }
+            calculate_total_size += sizeof(uint16_t); // point count
+            calculate_total_size += point_count * (sizeof(uint16_t) * 2 + sizeof(uint16_t)); // positions + scaled timestamp
+            i += point_count; // Skip the points we'll batch
+            
+        } else if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+            calculate_total_size += sizeof(uint16_t) * 2; // position as uint16
+            calculate_total_size += sizeof(uint8_t); // color index
+            calculate_total_size += sizeof(uint8_t); // size
+            
+            // Count consecutive stroke points
+            int point_count = 0;
+            for (int j = i + 1; j < events_to_serialize.size(); j++) {
+                if (events_to_serialize[j].type == STROKE_POINT || events_to_serialize[j].type == ERASE_POINT) {
+                    point_count++;
+                } else {
+                    break;
+                }
+            }
+            calculate_total_size += sizeof(uint16_t); // point count
+            calculate_total_size += point_count * (sizeof(uint16_t) * 2 + sizeof(uint16_t)); // positions + scaled timestamps
+            i += point_count; // Skip the points we'll batch
+            
+        } else if (event.type == CALLBACK_EVENT) {
+            calculate_total_size += sizeof(uint16_t) * 2; // position as uint16
+        }
+        // STROKE_END, ERASE_END, CLEAR_CANVAS have no additional data
+    }
+    
+    result.resize(calculate_total_size);
+
+    int offset = 0;
+
+	result.write[offset] = 1; // VERSION! Starting at 1 :)
+	offset += sizeof(uint8_t);
+
+    // Write color palette
+    result.write[offset] = static_cast<uint8_t>(unique_colors.size());
+    offset += sizeof(uint8_t);
+    
+	// print_line(vformat("Writing color palette, unique colors size: %d", unique_colors.size()));
+    for (const Color &color : unique_colors) {
+        offset += encode_float(color.r, &result.write[offset]);
+        offset += encode_float(color.g, &result.write[offset]);
+        offset += encode_float(color.b, &result.write[offset]);
+    }
+    
+    // Write events
+    for (int i = 0; i < events_to_serialize.size(); i++) {
+        const DrawingEvent &event = events_to_serialize[i];
+        
+        result.write[offset] = static_cast<uint8_t>(event.type);
+        offset += sizeof(uint8_t);
+
+        offset += encode_uint16(static_cast<uint16_t>(event.timestamp * 9.1f), &result.write[offset]);
+        
+		// print_line(vformat("Writing event type: %d with timestamp: %.3f uint16_t %d", event.type, event.timestamp, static_cast<uint16_t>(event.timestamp * 9.1f)));
+
+        if (event.type == STROKE_START || event.type == ERASE_START || event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+            // Write position as uint16
+            offset += encode_uint16(static_cast<uint16_t>(event.position.x), &result.write[offset]);
+            offset += encode_uint16(static_cast<uint16_t>(event.position.y), &result.write[offset]);
+            // print_line(vformat("Writing start position: %.3f, %.3f as uint16_t %d %d", event.position.x, event.position.y, static_cast<uint16_t>(event.position.x), static_cast<uint16_t>(event.position.y)));
+
+			if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+				 // Write color index
+				result.write[offset] = color_palette[event.color];
+				offset += sizeof(uint8_t);
+				
+				// Write size
+				result.write[offset] = static_cast<uint8_t>(std::round(event.size));
+				offset += sizeof(uint8_t);
+			}
+
+            // Count and write consecutive stroke points
+            int point_count = 0;
+            for (int j = i + 1; j < events_to_serialize.size(); j++) {
+                if (events_to_serialize[j].type == STROKE_POINT || events_to_serialize[j].type == ERASE_POINT) {
+                    point_count++;
+                } else {
+                    break;
+                }
+            }
+            
+            offset += encode_uint16(point_count, &result.write[offset]);
+            
+			// Saving current position to calculate the delta
+			int current_x = static_cast<int>(event.position.x);
+			int current_y = static_cast<int>(event.position.y);
+			float current_timestamp = event.timestamp;
+			// print_line(vformat("Saving current position to calculate delta: %.3f, %.3f as int %d %d", event.position.x, event.position.y, current_x, current_y));
+            // Write all stroke points in batch
+            for (int j = 1; j <= point_count; j++) {
+                const DrawingEvent &point_event = events_to_serialize[i + j];
+				int delta_x = static_cast<int>(point_event.position.x) - current_x;
+				int delta_y = static_cast<int>(point_event.position.y) - current_y;
+				float real_delta_timestamp = point_event.timestamp - current_timestamp;
+				
+				current_x += delta_x;
+				current_y += delta_y;
+				current_timestamp += real_delta_timestamp;
+				if (delta_x >= -128 && delta_x <= 127 && 
+					delta_y >= -128 && delta_y <= 127 &&
+					(real_delta_timestamp * 900.1f) < 255) {
+					result.write[offset++] = 0; // small delta flag
+					result.write[offset++] = static_cast<int8_t>(delta_x);
+					result.write[offset++] = static_cast<int8_t>(delta_y);
+					result.write[offset++] = static_cast<uint8_t>(real_delta_timestamp * 900.1f);
+					// print_line(vformat("Writing delta: %.3f, %.3f, timestamp %.3f as int %d %d and timestamp delta %.3f deltas casted to int8_t %d %d and timestamp uint8_t %d", point_event.position.x, point_event.position.y, point_event.timestamp, delta_x, delta_y, real_delta_timestamp, static_cast<int8_t>(delta_x), static_cast<int8_t>(delta_y), static_cast<uint8_t>(real_delta_timestamp * 9.1f)));
+				} else {
+					result.write[offset++] = 1; // large delta flag
+					offset += encode_uint16(static_cast<uint16_t>(delta_x), &result.write[offset]);
+					offset += encode_uint16(static_cast<uint16_t>(delta_y), &result.write[offset]);
+					offset += encode_uint16(static_cast<uint16_t>(real_delta_timestamp * 900.1f), &result.write[offset]);
+					// print_line(vformat("Writing delta: %.3f, %.3f, timestamp %.3f as int %d %d and timestamp delta %.3f deltas casted to uint16_t %d %d %d", point_event.position.x, point_event.position.y, point_event.timestamp, delta_x, delta_y, real_delta_timestamp, static_cast<uint16_t>(delta_x), static_cast<uint16_t>(delta_y), static_cast<uint16_t>(real_delta_timestamp * 9.1f)));
+				}
+            }
+            
+            i += point_count + 1; // Skip the points we just serialized and the stroke end event
+            
+        } else if (event.type == CALLBACK_EVENT) {
+            offset += encode_uint16(static_cast<uint16_t>(event.position.x), &result.write[offset]);
+            offset += encode_uint16(static_cast<uint16_t>(event.position.y), &result.write[offset]);
+        }
+        // STROKE_END, ERASE_END, CLEAR_CANVAS have no additional data
+    }
+    
+	result.write[offset] = UINT8_MAX;
+
+    return result;
 }
 
 bool YDrawing::deserialize_events(const PackedByteArray &data, Vector<DrawingEvent> &events_destination) {
-	if (data.size() < sizeof(int)) return false;
-	
-	events_destination.clear();
-	
+	 if (data.size() < sizeof(uint32_t)) 
+	 {
+		// print_line("Data size is less than 4 bytes");
+		return false;
+	 }
+    
+    events_destination.clear();
+    // print_line(vformat("Deserializing events, data size: %d", data.size()));
     const uint8_t *ptr = data.ptr();
+    int offset = 0;
 
-    // type = static_cast<MessageType>(ptr[0]);
-    // channel = ptr[1];
-    // reliability = ptr[2];
-    // targetClientId = decode_uint32(ptr + 3);
-    // packetData.resize(decode_uint32(ptr + 7));
-    // memcpy(packetData.ptrw(), &p_data[11], packetData.size());
+	uint8_t version = ptr[offset];
+	offset += sizeof(uint8_t);
 
-	// Read event count
-	int event_count = decode_uint32(ptr);
-	int offset = sizeof(uint32_t);
-	
-	for (int i = 0; i < event_count; i++) {
-		DrawingEvent event;
-		event.type = static_cast<EventType>(ptr[offset]);
-		offset += sizeof(uint8_t);
-		event.timestamp = decode_float(ptr + offset);
-		offset += sizeof(float);
-		if (event.type == STROKE_POINT || event.type == ERASE_POINT ||
-			event.type == CALLBACK_EVENT || event.type == STROKE_START ||
-			event.type == ERASE_START || event.type == STROKE_START_CHANGED ||
-			event.type == ERASE_START_CHANGED) {
-			event.position.x = decode_float(ptr + offset);
-			offset += sizeof(float);
-			event.position.y = decode_float(ptr + offset);
-			offset += sizeof(float);
-		}
-		if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
-			event.color.r = decode_float(ptr + offset);
-			offset += sizeof(float);
-			event.color.g = decode_float(ptr + offset);
-			offset += sizeof(float);
-			event.color.b = decode_float(ptr + offset);
-			offset += sizeof(float);
-			event.color.a = 1.0f;
-			event.size = static_cast<float>(ptr[offset]);
-			offset += sizeof(uint8_t);
-		}
-		events_destination.push_back(event);
+	if (version != 1) {
+		print_line(vformat("Unsupported version: %d", version));
+		return false;
 	}
-	return true;
+
+    // Read color palette
+    uint8_t palette_size = ptr[offset];
+    offset += sizeof(uint8_t);
+    
+    Vector<Color> color_palette;
+    color_palette.resize(palette_size);
+    
+	// print_line(vformat("Reading color palette size: %d", palette_size));
+    for (int i = 0; i < palette_size; i++) {
+        color_palette.write[i].r = decode_float(ptr + offset);
+        offset += sizeof(float);
+        color_palette.write[i].g = decode_float(ptr + offset);
+        offset += sizeof(float);
+        color_palette.write[i].b = decode_float(ptr + offset);
+        offset += sizeof(float);
+        color_palette.write[i].a = 1.0f;
+    }
+	// print_line(vformat("Reading events"));
+    // Read events until finding a 255 byte in place of the event type or end of data
+	bool found_end = false;
+    while(!found_end && offset < data.size()) {
+		uint8_t event_type_byte = ptr[offset];
+        offset += sizeof(uint8_t);
+
+		if (event_type_byte == UINT8_MAX) {
+			found_end = true;
+			// print_line(vformat("Found end of events"));
+			break;
+		}
+
+        DrawingEvent event;
+        event.type = static_cast<EventType>(event_type_byte);
+
+		uint16_t scaled_timestamp = decode_uint16(ptr + offset);
+		event.timestamp = static_cast<float>(scaled_timestamp) / 9.1f;
+		offset += sizeof(uint16_t);
+
+		// print_line(vformat("Reading event type: %d with timestamp: %.3f uint16_t %d", event.type, event.timestamp, scaled_timestamp));
+
+		if (event.type == CLEAR_CANVAS || event.type == UNDO_SNAPSHOT || event.type == REDO_SNAPSHOT) {
+			events_destination.push_back(event);
+			continue;
+		}
+        
+        if (event.type == STROKE_START || event.type == ERASE_START || event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+			uint16_t starting_x = decode_uint16(ptr + offset);
+			offset += sizeof(uint16_t);
+			uint16_t starting_y = decode_uint16(ptr + offset);
+			offset += sizeof(uint16_t);
+			event.position.x = static_cast<float>(starting_x);
+			event.position.y = static_cast<float>(starting_y);
+            
+			if (event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
+				uint8_t color_index = ptr[offset];
+				offset += sizeof(uint8_t);
+				event.color = color_palette[color_index];
+				
+				event.size = static_cast<float>(ptr[offset]);
+				offset += sizeof(uint8_t);
+			}
+
+            events_destination.push_back(event);
+            
+            // Read batched stroke points
+            uint16_t point_count = decode_uint16(ptr + offset);
+            offset += sizeof(uint16_t);
+            
+			int current_x = starting_x;
+			int current_y = starting_y;
+			float current_timestamp = event.timestamp;
+			// print_line(vformat("Reading stroke starting position: %d %d and timestamp: %d. Point count %d", starting_x, starting_y, scaled_timestamp, point_count));
+            for (int j = 0; j < point_count; j++) {
+                DrawingEvent point_event;
+                point_event.type = (event.type == STROKE_START || event.type == STROKE_START_CHANGED) ? STROKE_POINT : ERASE_POINT;
+
+				uint8_t small_delta_flag = ptr[offset];
+				offset += sizeof(uint8_t);
+
+				if (small_delta_flag == 0) {
+					int8_t delta_x = static_cast<int8_t>(ptr[offset]);
+					offset += sizeof(int8_t);
+					int8_t delta_y = static_cast<int8_t>(ptr[offset]);
+					offset += sizeof(int8_t);
+					uint8_t delta_timestamp = ptr[offset];
+					offset += sizeof(uint8_t);
+					current_x += delta_x;
+					current_y += delta_y;
+					current_timestamp += static_cast<float>(delta_timestamp) / 900.1f;
+					// print_line(vformat("Reading delta: %.3f, %.3f, timestamp %.3f as int %d %d and uint16 %d new current int %d %d and timestamp %d", static_cast<float>(current_x), static_cast<float>(current_y), current_timestamp, delta_x, delta_y, delta_timestamp, current_x, current_y, current_timestamp));
+				} else {
+					int16_t delta_x = static_cast<int16_t>(decode_uint16(ptr + offset));
+					offset += sizeof(uint16_t);
+					int16_t delta_y = static_cast<int16_t>(decode_uint16(ptr + offset));
+					offset += sizeof(uint16_t);
+					uint16_t delta_timestamp = decode_uint16(ptr + offset);
+					offset += sizeof(uint16_t);
+					current_x += delta_x;
+					current_y += delta_y;
+					current_timestamp += static_cast<float>(delta_timestamp) / 900.1f;
+					// print_line(vformat("Reading delta: %.3f, %.3f, timestamp %.3f as int %d %d and uint16 %d new current int %d %d and timestamp %d", static_cast<float>(current_x), static_cast<float>(current_y), current_timestamp, delta_x, delta_y, delta_timestamp, current_x, current_y, current_timestamp));
+				}
+				point_event.position.x = static_cast<float>(current_x);
+				point_event.position.y = static_cast<float>(current_y);
+				point_event.timestamp = static_cast<float>(current_timestamp);
+                events_destination.push_back(point_event);
+            }
+            
+            // Add stroke end event
+            DrawingEvent end_event;
+            end_event.type = (event.type == STROKE_START || event.type == STROKE_START_CHANGED) ? STROKE_END : ERASE_END;
+            end_event.timestamp = events_destination[events_destination.size() - 1].timestamp; // Use last point's timestamp
+            events_destination.push_back(end_event);
+        } else if (event.type == CALLBACK_EVENT) {
+            event.position.x = static_cast<float>(decode_uint16(ptr + offset));
+            offset += sizeof(uint16_t);
+            event.position.y = static_cast<float>(decode_uint16(ptr + offset));
+            offset += sizeof(uint16_t);
+            events_destination.push_back(event);
+        }
+    }
+    // print_line(vformat("Deserialized events, size: %d", events_destination.size()));
+    return true;
 }
 
 void YDrawing::draw_stroke_incremental(const Vector<Vector2> &smoothing_points) {
@@ -965,7 +1181,10 @@ void YDrawing::playback_events(const PackedByteArray &event_data, float speed_mu
 		playback_with_pauses = include_pauses;
 		playback_index = 0;
 		// Clear canvas for playback
-		clear_canvas();
+		if (canvas_image.is_valid()) {
+			canvas_image->fill(background_color);
+			needs_update = true;
+		}
 	}
 }
 
@@ -994,6 +1213,7 @@ void YDrawing::process_playback_events() {
         //print_line(vformat("Playing back event: %d at index %d and position %s", event.type, playback_index, event.position));
         switch (event.type) {
 			case STROKE_START_CHANGED:
+				// print_line(vformat("Playing back stroke start changed, position %.3f, %.3f and color %s and size %.3f", event.position.x, event.position.y, event.color, event.size));
 				start_stroke_custom(event.position, event.color, event.size);
 				break;
 			case ERASE_START_CHANGED:
@@ -1004,6 +1224,7 @@ void YDrawing::process_playback_events() {
                 start_stroke(event.position);
                 break;
             case STROKE_POINT:
+				// print_line(vformat("Playing back stroke point, position %.3f, %.3f", event.position.x, event.position.y));
                 add_stroke_point(event.position);
                 break;
             case STROKE_END:
@@ -1024,6 +1245,12 @@ void YDrawing::process_playback_events() {
             case CALLBACK_EVENT:
 				emit_signal(SNAME("callback_event"), event.position);
 				break;
+			case UNDO_SNAPSHOT:
+				undo();
+				break;
+			case REDO_SNAPSHOT:
+				redo();
+				break;
         }
         playback_index++;
     }
@@ -1034,14 +1261,29 @@ void YDrawing::create_snapshot() {
     if (!create_snapshots) return;
 
 	if (snapshot_buffer.size() >= max_undo_steps) {
+		// Too many snapshots, remove the oldest one
 		snapshot_buffer.remove_at(0);
+
+		// Update undo stack
+		for (int i = undo_stack.size() - 1; i >= 0; i--) {
+			if (undo_stack[i] > 0) {
+				undo_stack.write[i] = undo_stack[i] - 1;
+			} else {
+				undo_stack.remove_at(i);
+			}
+		}
+	}
+	
+	if (redo_stack.size() > 0) {
+		// Clear redo stack when new action is performed
+		redo_stack.clear();
 	}
 	
 	PackedByteArray snapshot = compress_image(canvas_image);
 	snapshot_buffer.push_back(snapshot);
-	
-	// Clear redo stack when new action is performed
-	redo_stack.clear();
+	print_line(vformat("Created snapshot at index %d", snapshot_buffer.size() - 1));
+	// Add to undo stack
+	undo_stack.push_back(snapshot_buffer.size() - 1);
 }
 
 void YDrawing::apply_snapshot(const PackedByteArray &snapshot) {
@@ -1059,54 +1301,81 @@ PackedByteArray YDrawing::compress_image(const Ref<Image> &image) {
 
 Ref<Image> YDrawing::decompress_image(const PackedByteArray &data) {
 	Ref<Image> image = Image::create_empty(canvas_size.x, canvas_size.y, false, Image::FORMAT_RGBA8);
-	image->load_png_from_buffer(data);
+	Error err = image->load_png_from_buffer(data);
+	if (err != OK) {
+		print_line(vformat("Error decompressing image: %d", err));
+	}
 	return image;
 }
 
+bool YDrawing::can_undo() const {
+	return undo_stack.size() > 1;
+}
+
+bool YDrawing::can_redo() const {
+	return redo_stack.size() > 0;
+}
+
 void YDrawing::undo() {
-	if (undo_stack.size() > 0) {
-		int snapshot_index = undo_stack[undo_stack.size() - 1];
-		undo_stack.remove_at(undo_stack.size() - 1);
-		
-		if (snapshot_index >= 0 && snapshot_index < snapshot_buffer.size()) {
-			redo_stack.push_back(snapshot_index);
-			apply_snapshot(snapshot_buffer[snapshot_index]);
-		}
-	}
+    if (undo_stack.size() > 1) {  // Need at least 2 snapshots
+        if (should_record_event()) {
+            record_event(UNDO_SNAPSHOT);
+        }
+        
+        // Remove the current state from undo stack and add to redo stack
+        int current_snapshot_index = undo_stack[undo_stack.size() - 1];
+        undo_stack.remove_at(undo_stack.size() - 1);
+        redo_stack.push_back(current_snapshot_index);
+        
+        // Apply the PREVIOUS state (now the last item in undo_stack)
+        int previous_snapshot_index = undo_stack[undo_stack.size() - 1];
+        print_line(vformat("Undoing to snapshot at index %d", previous_snapshot_index));
+        
+        if (previous_snapshot_index >= 0 && previous_snapshot_index < snapshot_buffer.size()) {
+            apply_snapshot(snapshot_buffer[previous_snapshot_index]);
+        }
+    }
 }
 
 void YDrawing::redo() {
-	if (redo_stack.size() > 0) {
-		int snapshot_index = redo_stack[redo_stack.size() - 1];
-		redo_stack.remove_at(redo_stack.size() - 1);
-		
-		if (snapshot_index >= 0 && snapshot_index < snapshot_buffer.size()) {
-			undo_stack.push_back(snapshot_index);
-			apply_snapshot(snapshot_buffer[snapshot_index]);
-		}
-	}
+    if (redo_stack.size() > 0) {
+        if (should_record_event()) {
+            record_event(REDO_SNAPSHOT);
+        }
+        
+        int snapshot_index = redo_stack[redo_stack.size() - 1];
+        redo_stack.remove_at(redo_stack.size() - 1);
+        
+        print_line(vformat("Redoing snapshot at index %d", snapshot_index));
+        if (snapshot_index >= 0 && snapshot_index < snapshot_buffer.size()) {
+            undo_stack.push_back(snapshot_index);
+            apply_snapshot(snapshot_buffer[snapshot_index]);
+        }
+    }
 }
 
-PackedByteArray YDrawing::get_snapshot_buffer() const {
-	PackedByteArray result;
+TypedArray<PackedByteArray> YDrawing::get_snapshot_buffer() const {
+	TypedArray<PackedByteArray> result;
 	// Serialize snapshot buffer
 	for (int i = 0; i < snapshot_buffer.size(); i++) {
-		result.append_array(snapshot_buffer[i]);
+		result.append(snapshot_buffer[i]);
 	}
 	return result;
 }
 
-PackedByteArray YDrawing::get_undo_stack() const {
-	PackedByteArray result;
-	result.resize(undo_stack.size() * sizeof(int));
-	memcpy(result.ptrw(), undo_stack.ptr(), undo_stack.size() * sizeof(int));
+TypedArray<int> YDrawing::get_undo_stack() const {
+	TypedArray<int> result;
+	for (int i = 0; i < undo_stack.size(); i++) {
+		result.append(undo_stack[i]);
+	}
 	return result;
 }
 
-PackedByteArray YDrawing::get_redo_stack() const {
-	PackedByteArray result;
-	result.resize(redo_stack.size() * sizeof(int));
-	memcpy(result.ptrw(), redo_stack.ptr(), redo_stack.size() * sizeof(int));
+TypedArray<int> YDrawing::get_redo_stack() const {
+	TypedArray<int> result;
+	for (int i = 0; i < redo_stack.size(); i++) {
+		result.append(redo_stack[i]);
+	}
 	return result;
 }
 

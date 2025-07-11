@@ -33,7 +33,9 @@ public:
 		ERASE_POINT = 6,
 		ERASE_END = 7,
 		CLEAR_CANVAS = 8,
-		CALLBACK_EVENT = 9
+		CALLBACK_EVENT = 9,
+		UNDO_SNAPSHOT = 10,
+		REDO_SNAPSHOT = 11
 	};
 	
 
@@ -126,6 +128,8 @@ private:
 	// Serialization helpers
 	PackedByteArray serialize_events(const Vector<DrawingEvent> &events_to_serialize) const;
 	bool deserialize_events(const PackedByteArray &data, Vector<DrawingEvent> &events_destination);
+
+
 	
 	// Undo system helpers
 	void create_snapshot();
@@ -225,9 +229,11 @@ public:
 	// Undo/Redo
 	void undo();
 	void redo();
-	PackedByteArray get_snapshot_buffer() const;
-	PackedByteArray get_undo_stack() const;
-	PackedByteArray get_redo_stack() const;
+	bool can_undo() const;
+	bool can_redo() const;
+	TypedArray<PackedByteArray> get_snapshot_buffer() const;
+	TypedArray<int> get_undo_stack() const;
+	TypedArray<int> get_redo_stack() const;
 	void clear_undo_stack();
 	void clear_redo_stack();
 
