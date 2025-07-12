@@ -37,6 +37,24 @@ public:
 		UNDO_SNAPSHOT = 10,
 		REDO_SNAPSHOT = 11
 	};
+
+	String event_type_to_string(EventType p_type) const {
+		switch (p_type) {
+			case STROKE_START: return "STROKE_START";
+			case STROKE_START_CHANGED: return "STROKE_START_CHANGED";
+			case STROKE_POINT: return "STROKE_POINT";
+			case STROKE_END: return "STROKE_END";
+			case ERASE_START: return "ERASE_START";
+			case ERASE_START_CHANGED: return "ERASE_START_CHANGED";
+			case ERASE_POINT: return "ERASE_POINT";
+			case ERASE_END: return "ERASE_END";
+			case CLEAR_CANVAS: return "CLEAR_CANVAS";
+			case CALLBACK_EVENT: return "CALLBACK_EVENT";
+			case UNDO_SNAPSHOT: return "UNDO_SNAPSHOT";
+			case REDO_SNAPSHOT: return "REDO_SNAPSHOT";
+			default: return "UNKNOWN";
+		}
+	}
 	
 
 	void set_expand_mode(TextureRect::ExpandMode p_mode);
@@ -126,7 +144,7 @@ private:
 	void record_clear_canvas();
 	
 	// Serialization helpers
-	PackedByteArray serialize_events(const Vector<DrawingEvent> &events_to_serialize) const;
+	PackedByteArray serialize_events(const Vector<DrawingEvent> &events_to_serialize, bool print_debug = false) const;
 	bool deserialize_events(const PackedByteArray &data, Vector<DrawingEvent> &events_destination);
 
 
@@ -185,6 +203,10 @@ public:
 	void set_current_eraser_size(float p_size) { current_eraser_size = p_size; }
 	float get_current_eraser_size() const { return current_eraser_size; }
 	
+	int max_playback_brushes_this_frame = 250;
+	void set_max_playback_brushes_this_frame(int p_max) { max_playback_brushes_this_frame = p_max; }
+	int get_max_playback_brushes_this_frame() const { return max_playback_brushes_this_frame; }
+
 	void set_smoothing_enabled(bool p_enabled);
 	bool get_smoothing_enabled() const;
 	
@@ -214,12 +236,13 @@ public:
 	void set_record_during_playback(bool p_record_during_playback) { record_during_playback = p_record_during_playback; }
 	bool get_record_during_playback() const { return record_during_playback; }
 	
+	int playback_brushes_this_frame = 0;
 	bool is_skipping_playback = false;
 	void skip_playback_to_end();
 
 	// Recording and playback
-	PackedByteArray get_recorded_events() const;
-	PackedByteArray get_playing_back_events() const;
+	PackedByteArray get_recorded_events(bool print_debugs = false) const;
+	PackedByteArray get_playing_back_events(bool print_debugs = false) const;
 	void playback_events(const PackedByteArray &event_data, float speed_multiplier = 1.0f, bool include_pauses = false);
 	bool is_playing_back() const;
 	void stop_playback();
@@ -229,6 +252,10 @@ public:
 	
 	bool should_record_event() const;
 
+	Vector<Vector2> queued_callback_events_to_record;
+
+	bool prevent_record_snapshots = false;
+	
 	// Undo/Redo
 	void undo();
 	void redo();
