@@ -995,19 +995,27 @@ bool YDrawing::deserialize_events(const PackedByteArray &data, Vector<DrawingEve
 		print_line(vformat("Unsupported version: %d", version));
 		return false;
 	}
+	
+	// uint16_t current_canvas_size_x = static_cast<uint16_t>(canvas_size.x);
+	// uint16_t current_canvas_size_y = static_cast<uint16_t>(canvas_size.y);
+	// uint16_t canvas_size_x = current_canvas_size_x;
+	// uint16_t canvas_size_y = current_canvas_size_y;
 
 	bool has_timestamps = true;
 	if (version == 2) {
 		has_timestamps = ptr[offset] == 1;
 		offset += sizeof(uint8_t);
 
-		uint16_t canvas_size_x = decode_uint16(ptr + offset);
+		// uint16_t canvas_size_x = decode_uint16(ptr + offset);
 		offset += sizeof(uint16_t);
-		uint16_t canvas_size_y = decode_uint16(ptr + offset);
+		// uint16_t canvas_size_y = decode_uint16(ptr + offset);
 		offset += sizeof(uint16_t);
 		// Not using this yet. But I have plans for it in the future.
 		// canvas_size = Vector2i(canvas_size_x, canvas_size_y);
 	}
+
+	// bool different_canvas_size = current_canvas_size_x != canvas_size_x || current_canvas_size_y != canvas_size_y;
+
     // Read color palette
     uint8_t palette_size = ptr[offset];
     offset += sizeof(uint8_t);
@@ -1655,13 +1663,14 @@ PackedByteArray YDrawing::compress_drawing_result(const Ref<Image> &image, int t
 			result.write[offset++] = b;
 		}
 	}
-	
 	// Apply run-length encoding if requested
 	if (run_length_encoding) {
 		PackedByteArray rle_result;
-		rle_result.resize(sizeof(uint16_t) * 2 + sizeof(uint8_t)); // width, height, RLE flag
+    
+		// Reserve space for header: width (2 bytes) + height (2 bytes) + RLE flag (1 byte)
+		rle_result.resize(sizeof(uint16_t) * 2 + sizeof(uint8_t));
 		
-		// Copy header
+		// HEADER CONSTRUCTION: Same as before
 		rle_result.write[0] = result[0]; // width low byte
 		rle_result.write[1] = result[1]; // width high byte
 		rle_result.write[2] = result[2]; // height low byte
@@ -1671,49 +1680,96 @@ PackedByteArray YDrawing::compress_drawing_result(const Ref<Image> &image, int t
 		int header_size = sizeof(uint16_t) * 2 + sizeof(uint8_t);
 		int data_start = header_size;
 		
-		// Apply RLE to the filtered RGB data
+		// COMPRESSION MAIN LOOP:
 		int src_offset = data_start;
 		int total_encoded = 0;
 		
 		while (src_offset < result.size()) {
 			uint8_t current_byte = result[src_offset];
-			int count = 1;
+			int run_count = 1;
 			
-			// Count consecutive identical bytes
-			while (count < 255 && src_offset + count < result.size() && result[src_offset + count] == current_byte) {
-				count++;
+			// COUNT CONSECUTIVE IDENTICAL BYTES:
+			// Look ahead to see how many times this byte repeats
+			while (run_count < 255 &&                           // Don't exceed byte limit
+				src_offset + run_count < result.size() &&    // Don't go past end
+				result[src_offset + run_count] == current_byte) {
+				run_count++;
 			}
 			
-			// Ensure we don't exceed the maximum count
-			if (count > 255) {
-				count = 255;
-			}
-			
-
-			
-			if (count >= 3) {
-				// Use RLE encoding: 0xFE followed by count, then byte
-				// Use 0xFE as marker to avoid conflict with 0xFF in data
-				rle_result.append(0xFE);
-				rle_result.append(static_cast<uint8_t>(count));
-				rle_result.append(current_byte);
-				src_offset += count;
-				total_encoded += count;
-				print_line(vformat("RLE encoded: %d bytes of value 0x%02X", count, current_byte));
+			// ENCODING DECISION:
+			// Use RLE if we have 3+ identical bytes, otherwise use literal encoding
+			if (run_count >= 3) {
+				// RLE ENCODING: [2][count][repeated_value]				
+				rle_result.append(2);                           // Type: RLE data
+				rle_result.append(static_cast<uint8_t>(run_count)); // How many repetitions
+				rle_result.append(current_byte);                // The repeated byte
+				
+				src_offset += run_count;    // Skip all the repeated bytes
+				total_encoded += run_count;
+				
 			} else {
-				// Use literal encoding: byte as-is
-				rle_result.append(current_byte);
-				src_offset += 1;
-				total_encoded += 1;
+				// LITERAL ENCODING: [1][count][byte1][byte2]...[byteN]
+				// We found a run that's too short for RLE, so let's look ahead to see
+				// how many more non-repeating or short-repeating bytes we can group together
+				
+				int literal_start = src_offset;
+				int literal_count = 0;
+				
+				// LITERAL GROUPING LOOP:
+				// Keep adding bytes to our literal group until we find a good RLE opportunity
+				while (literal_count < 255 && src_offset < result.size()) {
+					current_byte = result[src_offset];
+					run_count = 1;
+					
+					// Check how many times this byte repeats
+					while (run_count < 255 &&
+						src_offset + run_count < result.size() &&
+						result[src_offset + run_count] == current_byte) {
+						run_count++;
+					}
+					
+					// If we found a good RLE opportunity (3+ repeats), stop literal grouping
+					if (run_count >= 3) {
+						break;
+					}
+					
+					// Otherwise, add this byte (and any short runs) to our literal group
+					int bytes_to_add = run_count;
+					// Make sure we don't exceed the 255 byte limit for literal groups
+					if (literal_count + bytes_to_add > 255) {
+						bytes_to_add = 255 - literal_count;
+					}
+					
+					literal_count += bytes_to_add;
+					src_offset += bytes_to_add;
+					
+					// If we've reached the literal group size limit, stop
+					if (literal_count >= 255) {
+						break;
+					}
+				}
+				
+				// WRITE LITERAL GROUP: [1][count][data...]
+				rle_result.append(1);                           // Type: Literal data
+				rle_result.append(static_cast<uint8_t>(literal_count)); // How many bytes
+				
+				// Copy all the literal bytes
+				for (int i = 0; i < literal_count; i++) {
+					rle_result.append(result[literal_start + i]);
+				}
+				
+				total_encoded += literal_count;
 			}
 		}
 		
-		print_line(vformat("RLE compression completed: %d bytes encoded, result size: %d", total_encoded, rle_result.size()));
+		// print_line(vformat("RLE compression completed: %d bytes encoded, result size: %d", 
+						// total_encoded, rle_result.size()));
 		
-		// Validate that we encoded the correct amount of data
+		// VALIDATION:
 		int expected_encoded = pixel_count * 3;
 		if (total_encoded != expected_encoded) {
-			print_line(vformat("RLE compression size mismatch: expected %d, encoded %d", expected_encoded, total_encoded));
+			print_line(vformat("RLE compression size mismatch: expected %d, encoded %d", 
+							expected_encoded, total_encoded));
 		}
 		
 		return rle_result;
@@ -1745,41 +1801,89 @@ Ref<Image> YDrawing::decompress_drawing_result(const PackedByteArray &compressed
 	// Decompress RLE if needed
 	PackedByteArray decompressed_data;
 	if (uses_rle) {
-		// Decompress RLE data
+		/*
+		* NEW RLE DECODING PROCESS:
+		* 
+		* Our new format uses structured chunks: [TYPE][COUNT][DATA...]
+		* - TYPE 1 = Literal data (read COUNT bytes as-is)
+		* - TYPE 2 = RLE data (read 1 byte, repeat it COUNT times)
+		* 
+		* This is much simpler than the old escape-sequence approach!
+		*/
+		
 		int rle_decompressed_count = 0;
+		
+		// Process all chunks until we've read all compressed data
 		while (offset < compressed_data.size()) {
-			uint8_t current_byte = ptr[offset++];
 			
-			if (current_byte == 0xFE && offset + 1 < compressed_data.size()) {
-				// RLE encoded: next byte is count, then the repeated byte
-				uint8_t count = ptr[offset++];
-				if (offset < compressed_data.size()) {
-					uint8_t repeated_byte = ptr[offset++];
-					
-					for (int i = 0; i < count; i++) {
-						decompressed_data.append(repeated_byte);
-						rle_decompressed_count++;
-					}
-				} else {
-					// Malformed RLE data - missing repeated byte
-					print_line("Malformed RLE data - missing repeated byte");
+			// SAFETY CHECK: Make sure we have at least TYPE and COUNT bytes
+			if (offset + 1 >= compressed_data.size()) {
+				print_line("Malformed RLE data - missing TYPE or COUNT byte");
+				return Ref<Image>();
+			}
+			
+			// Read the chunk header
+			uint8_t chunk_type = ptr[offset++];  // 1 = literal, 2 = RLE
+			uint8_t chunk_count = ptr[offset++]; // How many bytes/repetitions
+
+			if (chunk_type == 1) {
+				// LITERAL CHUNK: [1][count][byte1][byte2]...[byteN]
+				// Read COUNT bytes and store them as-is
+				
+				// Safety check: make sure we have enough data
+				if (offset + chunk_count > compressed_data.size()) {
+					print_line(vformat("Malformed RLE data - literal chunk needs %d bytes but only %d available", 
+									chunk_count, compressed_data.size() - offset));
 					return Ref<Image>();
 				}
+				
+				// Copy all literal bytes
+				for (int i = 0; i < chunk_count; i++) {
+					decompressed_data.append(ptr[offset++]);
+					rle_decompressed_count++;
+				}				
+			} else if (chunk_type == 2) {
+				// RLE CHUNK: [2][count][repeated_byte_value]
+				// Read 1 byte and repeat it COUNT times
+				
+				// Safety check: make sure we have the repeated byte
+				if (offset >= compressed_data.size()) {
+					print_line("Malformed RLE data - missing repeated byte value");
+					return Ref<Image>();
+				}
+				
+				uint8_t repeated_byte = ptr[offset++];
+				
+				// Output the byte COUNT times
+				for (int i = 0; i < chunk_count; i++) {
+					decompressed_data.append(repeated_byte);
+					rle_decompressed_count++;
+				}				
 			} else {
-				// Literal byte
-				decompressed_data.append(current_byte);
-				rle_decompressed_count++;
+				// UNKNOWN CHUNK TYPE: This shouldn't happen with valid data
+				print_line(vformat("Unknown RLE chunk type: %d", chunk_type));
+				return Ref<Image>();
+			}
+			
+			// SAFETY CHECK: Prevent infinite loops or memory issues
+			// If we've already decompressed more data than expected, something is wrong
+			if (rle_decompressed_count > pixel_count * 3) {
+				print_line(vformat("RLE decompression exceeded expected size: %d > %d", 
+								rle_decompressed_count, pixel_count * 3));
+				return Ref<Image>();
 			}
 		}
 		
-		print_line(vformat("RLE decompression completed: %d bytes decompressed", rle_decompressed_count));
+		// print_line(vformat("RLE decompression completed: %d bytes decompressed", rle_decompressed_count));
 		
-		// Check if we have enough data
+		// FINAL VALIDATION: Check if we have exactly the right amount of data
 		if (decompressed_data.size() != pixel_count * 3) {
-			print_line(vformat("RLE decompression size mismatch: expected %d, got %d", pixel_count * 3, decompressed_data.size()));
+			print_line(vformat("RLE decompression size mismatch: expected %d, got %d", 
+							pixel_count * 3, decompressed_data.size()));
 			return Ref<Image>();
 		}
-	} else {
+		
+	}  else {
 		// No RLE, check expected size
 		int expected_size = sizeof(uint16_t) * 2 + sizeof(uint8_t) + pixel_count * 3;
 		if (compressed_data.size() != expected_size) {
