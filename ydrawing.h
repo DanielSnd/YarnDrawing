@@ -85,7 +85,6 @@ private:
 	
 	Color last_stroke_color;
 	float last_stroke_size;
-	float last_erase_size;
 
 	// Drawing state
 	Ref<Image> canvas_image;
@@ -106,8 +105,8 @@ private:
 	float current_playback_time;
 	int playback_index;
 	
-	// Undo system
-	Vector<PackedByteArray> snapshot_buffer;
+	// Undo system - now using raw pixel data instead of PNG compression
+	Vector<PackedByteArray> snapshot_buffer; // Now stores raw RGBA8 pixel data
 
 	Vector2 last_stroke_point;
 	Vector<int> undo_stack;
@@ -147,13 +146,11 @@ private:
 	PackedByteArray serialize_events(const Vector<DrawingEvent> &events_to_serialize, bool print_debug = false) const;
 	bool deserialize_events(const PackedByteArray &data, Vector<DrawingEvent> &events_destination);
 
-
-	
-	// Undo system helpers
+	// Undo system helpers - now using raw pixel data
 	void create_snapshot();
 	void apply_snapshot(const PackedByteArray &snapshot);
-	PackedByteArray compress_image(const Ref<Image> &image);
-	Ref<Image> decompress_image(const PackedByteArray &data);
+	PackedByteArray capture_raw_pixels(const Ref<Image> &image);
+	void restore_raw_pixels(const PackedByteArray &pixel_data, Ref<Image> &image);
 	
 	// Playback helpers
 	void process_playback_events();
@@ -198,10 +195,6 @@ public:
 	float current_brush_size = 1.0f;
 	void set_current_brush_size(float p_size) { current_brush_size = p_size; }
 	float get_current_brush_size() const { return current_brush_size; }
-
-	float current_eraser_size = 1.0f;
-	void set_current_eraser_size(float p_size) { current_eraser_size = p_size; }
-	float get_current_eraser_size() const { return current_eraser_size; }
 	
 	int max_playback_brushes_this_frame = 250;
 	void set_max_playback_brushes_this_frame(int p_max) { max_playback_brushes_this_frame = p_max; }
@@ -235,10 +228,18 @@ public:
 	bool record_during_playback = false;
 	void set_record_during_playback(bool p_record_during_playback) { record_during_playback = p_record_during_playback; }
 	bool get_record_during_playback() const { return record_during_playback; }
+
+	bool serialize_with_pauses = false;
+	void set_serialize_with_pauses(bool p_serialize_with_pauses) { serialize_with_pauses = p_serialize_with_pauses; }
+	bool get_serialize_with_pauses() const { return serialize_with_pauses; }
 	
 	int playback_brushes_this_frame = 0;
 	bool is_skipping_playback = false;
 	void skip_playback_to_end();
+
+	bool print_debugs_playback = false;
+	void set_print_debugs_playback(bool p_print_debugs_playback) { print_debugs_playback = p_print_debugs_playback; }
+	bool get_print_debugs_playback() const { return print_debugs_playback; }
 
 	// Recording and playback
 	PackedByteArray get_recorded_events(bool print_debugs = false) const;
@@ -256,6 +257,8 @@ public:
 
 	bool prevent_record_snapshots = false;
 	
+	Ref<Image> get_canvas_image() const;
+
 	// Undo/Redo
 	void undo();
 	void redo();
@@ -267,4 +270,7 @@ public:
 	void clear_undo_stack();
 	void clear_redo_stack();
 
+	// Static PNG-style compression methods
+	static PackedByteArray compress_drawing_result(const Ref<Image> &image, int target_width, int target_height, bool run_length_encoding = false);
+	static Ref<Image> decompress_drawing_result(const PackedByteArray &compressed_data, bool run_length_encoding = false);
 };

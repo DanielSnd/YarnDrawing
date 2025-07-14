@@ -41,10 +41,6 @@ void YDrawing::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_current_brush_size"), &YDrawing::get_current_brush_size);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "current_brush_size"), "set_current_brush_size", "get_current_brush_size");
 
-	ClassDB::bind_method(D_METHOD("set_current_eraser_size", "size"), &YDrawing::set_current_eraser_size, DEFVAL(1.0f));
-	ClassDB::bind_method(D_METHOD("get_current_eraser_size"), &YDrawing::get_current_eraser_size);
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "current_eraser_size"), "set_current_eraser_size", "get_current_eraser_size");
-
 	ClassDB::bind_method(D_METHOD("set_create_snapshots", "create_snapshots"), &YDrawing::set_create_snapshots);
 	ClassDB::bind_method(D_METHOD("get_create_snapshots"), &YDrawing::get_create_snapshots);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "create_snapshots"), "set_create_snapshots", "get_create_snapshots");
@@ -84,6 +80,8 @@ void YDrawing::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("reset_counting_time"), &YDrawing::reset_counting_time);
 
+	ClassDB::bind_method(D_METHOD("get_canvas_image"), &YDrawing::get_canvas_image);
+
 	// Undo/Redo
 	ClassDB::bind_method(D_METHOD("undo"), &YDrawing::undo);
 	ClassDB::bind_method(D_METHOD("redo"), &YDrawing::redo);
@@ -99,6 +97,14 @@ void YDrawing::_bind_methods() {
     ClassDB::bind_method(D_METHOD("draw_thick_polyline", "points", "color", "width"), &YDrawing::draw_thick_polyline);
     ClassDB::bind_method(D_METHOD("draw_circle_aa", "center", "radius", "color", "filled"), &YDrawing::draw_circle_aa);
     ClassDB::bind_method(D_METHOD("draw_thick_line_aa", "p1", "p2", "color", "half_width"), &YDrawing::draw_thick_line_aa);
+
+	ClassDB::bind_method(D_METHOD("set_print_debugs_playback", "print_debugs_playback"), &YDrawing::set_print_debugs_playback);
+	ClassDB::bind_method(D_METHOD("get_print_debugs_playback"), &YDrawing::get_print_debugs_playback);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "print_debugs_playback"), "set_print_debugs_playback", "get_print_debugs_playback");
+
+    // Static PNG-style compression methods
+    ClassDB::bind_static_method("YDrawing", D_METHOD("compress_drawing_result", "image", "target_width", "target_height", "run_length_encoding"), &YDrawing::compress_drawing_result, DEFVAL(false));
+    ClassDB::bind_static_method("YDrawing", D_METHOD("decompress_drawing_result", "compressed_data", "run_length_encoding"), &YDrawing::decompress_drawing_result, DEFVAL(false));
 
     ClassDB::bind_method(D_METHOD("set_dirty"), &YDrawing::set_dirty);
 	// Signals
@@ -282,7 +288,6 @@ YDrawing::YDrawing() {
 	is_erasing = false;
 	current_color = Color(0.0f, 0.0f, 0.0f, 1.0f);
 	current_brush_size = 5.0f;
-	current_eraser_size = 20.0f;
 	last_stroke_color = current_color;
 	last_stroke_size = 0.0f;
 	
@@ -428,7 +433,7 @@ void YDrawing::start_erase(const Vector2 &position) {
 	add_smoothing_point(position); // Will be updated with first point
 	
 	if (should_record_event()) {
-		record_erase_start(position, current_eraser_size);
+		record_erase_start(position, current_brush_size);
 	}
 }
 
@@ -718,12 +723,12 @@ void YDrawing::record_stroke_end() {
 	record_event(STROKE_END);
 }
 
-void YDrawing::record_erase_start(const Vector2 &position, float eraser_size) {
-	if (last_erase_size - eraser_size > 0.001f) {
-		record_event(ERASE_START_CHANGED, position, background_color, eraser_size);
-		last_erase_size = eraser_size;
+void YDrawing::record_erase_start(const Vector2 &position, float brush_size) {
+	if (std::abs(last_stroke_size - brush_size) > 0.001f) {
+		record_event(ERASE_START_CHANGED, position, background_color, brush_size);
+		last_stroke_size = brush_size;
 	} else {
-		record_event(ERASE_START, position, background_color, eraser_size);
+		record_event(ERASE_START, position, background_color, brush_size);
 	}
 }
 
@@ -759,13 +764,18 @@ PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to
     
     // Calculate total size
     int calculate_total_size = 2; // I start with a version byte and I use a 255 byte in the place of an event type to mark the end of the data
-    calculate_total_size += sizeof(uint32_t); // event count
+    calculate_total_size += sizeof(uint8_t); // uses timestamps flag
+	calculate_total_size += sizeof(uint16_t) * 2; // canvas size x and y as uint16
     calculate_total_size += sizeof(uint8_t); // color palette size
     calculate_total_size += unique_colors.size() * sizeof(float) * 3; // color palette (RGB)
     
     for (int i = 0; i < events_to_serialize.size(); i++) {
         const DrawingEvent &event = events_to_serialize[i];
-        calculate_total_size += sizeof(uint8_t) + sizeof(uint16_t); // type + scaled timestamp
+		if (serialize_with_pauses) {
+			calculate_total_size += sizeof(uint8_t) + sizeof(uint16_t); // type + scaled timestamp
+		} else {
+			calculate_total_size += sizeof(uint8_t); // type
+		}
         
         if (event.type == STROKE_START || event.type == ERASE_START || event.type == STROKE_START_CHANGED || event.type == ERASE_START_CHANGED) {
             calculate_total_size += sizeof(uint16_t) * 2; // position as uint16
@@ -785,7 +795,37 @@ PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to
                 }
             }
             calculate_total_size += sizeof(uint16_t); // point count
-            calculate_total_size += point_count * (sizeof(uint16_t) * 2 + sizeof(uint16_t)); // positions + scaled timestamp
+            
+            // Calculate size for each point based on delta size and timestamp inclusion
+            int current_x = static_cast<int>(event.position.x);
+            int current_y = static_cast<int>(event.position.y);
+            float current_timestamp = event.timestamp;
+            
+            for (int j = 1; j <= point_count; j++) {
+                const DrawingEvent &point_event = events_to_serialize[i + j];
+                int delta_x = static_cast<int>(point_event.position.x) - current_x;
+                int delta_y = static_cast<int>(point_event.position.y) - current_y;
+                float real_delta_timestamp = point_event.timestamp - current_timestamp;
+                
+                current_x += delta_x;
+                current_y += delta_y;
+                current_timestamp += real_delta_timestamp;
+                
+                if (delta_x >= -128 && delta_x <= 127 && 
+                    delta_y >= -128 && delta_y <= 127 &&
+                    (!serialize_with_pauses || (real_delta_timestamp * 900.1f) < 255)) {
+                    calculate_total_size += 3; // small delta flag + 2 int8
+                    if (serialize_with_pauses) {
+                        calculate_total_size += 1; // uint8 timestamp
+                    }
+                } else {
+                    calculate_total_size += 5; // large delta flag + 2 uint16
+                    if (serialize_with_pauses) {
+                        calculate_total_size += 2; // uint16 timestamp
+                    }
+                }
+            }
+            
             i += point_count + 1; // Skip the points we'll batch and the stroke end event
         } else if (event.type == CALLBACK_EVENT) {
             calculate_total_size += sizeof(uint16_t) * 2; // position as uint16
@@ -797,8 +837,19 @@ PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to
 
     int offset = 0;
 
-	result.write[offset] = 1; // VERSION! Starting at 1 :)
+	result.write[offset] = 2; // VERSION! Starting at 1 :) we're now at 2.
 	offset += sizeof(uint8_t);
+
+	if (serialize_with_pauses) {
+		result.write[offset] = 1; // has_timestamps flag
+		offset += sizeof(uint8_t);
+	} else {
+		result.write[offset] = 0; // has_timestamps flag
+		offset += sizeof(uint8_t);
+	}
+
+	offset += encode_uint16(static_cast<uint16_t>(canvas_size.x), &result.write[offset]);
+	offset += encode_uint16(static_cast<uint16_t>(canvas_size.y), &result.write[offset]);
 
     // Write color palette
     result.write[offset] = static_cast<uint8_t>(unique_colors.size());
@@ -818,8 +869,10 @@ PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to
         result.write[offset] = static_cast<uint8_t>(event.type);
         offset += sizeof(uint8_t);
 
-        offset += encode_uint16(static_cast<uint16_t>(event.timestamp * 9.1f), &result.write[offset]);
-        
+		if (serialize_with_pauses) {
+			offset += encode_uint16(static_cast<uint16_t>(event.timestamp * 9.1f), &result.write[offset]);
+		}
+
 		if (print_debug) {
 			print_line(vformat("Writing event type: %s with timestamp: %.3f uint16_t %d", event_type_to_string(event.type), event.timestamp, static_cast<uint16_t>(event.timestamp * 9.1f)));
 		}
@@ -871,17 +924,24 @@ PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to
 				int delta_x = static_cast<int>(point_event.position.x) - current_x;
 				int delta_y = static_cast<int>(point_event.position.y) - current_y;
 				float real_delta_timestamp = point_event.timestamp - current_timestamp;
-				
+				if (serialize_with_pauses) {
+					real_delta_timestamp = point_event.timestamp - current_timestamp;
+				}
 				current_x += delta_x;
 				current_y += delta_y;
+
 				current_timestamp += real_delta_timestamp;
 				if (delta_x >= -128 && delta_x <= 127 && 
 					delta_y >= -128 && delta_y <= 127 &&
-					(real_delta_timestamp * 900.1f) < 255) {
+					(!serialize_with_pauses || (real_delta_timestamp * 900.1f) < 255)) {
 					result.write[offset++] = 0; // small delta flag
 					result.write[offset++] = static_cast<int8_t>(delta_x);
 					result.write[offset++] = static_cast<int8_t>(delta_y);
-					result.write[offset++] = static_cast<uint8_t>(real_delta_timestamp * 900.1f);
+					
+					if (serialize_with_pauses) {
+						result.write[offset++] = static_cast<uint8_t>(real_delta_timestamp * 900.1f);
+					}
+
 					if (print_debug) {
 						print_line(vformat("Writing delta: %.3f, %.3f, timestamp %.3f as int %d %d and timestamp delta %.3f deltas casted to int8_t %d %d and timestamp uint8_t %d", point_event.position.x, point_event.position.y, point_event.timestamp, delta_x, delta_y, real_delta_timestamp, static_cast<int8_t>(delta_x), static_cast<int8_t>(delta_y), static_cast<uint8_t>(real_delta_timestamp * 9.1f)));
 					}
@@ -889,7 +949,11 @@ PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to
 					result.write[offset++] = 1; // large delta flag
 					offset += encode_uint16(static_cast<uint16_t>(delta_x), &result.write[offset]);
 					offset += encode_uint16(static_cast<uint16_t>(delta_y), &result.write[offset]);
-					offset += encode_uint16(static_cast<uint16_t>(real_delta_timestamp * 900.1f), &result.write[offset]);
+					
+					if (serialize_with_pauses) {
+						offset += encode_uint16(static_cast<uint16_t>(real_delta_timestamp * 900.1f), &result.write[offset]);
+					}
+
 					if (print_debug) {
 						print_line(vformat("Writing larger delta: %.3f, %.3f, timestamp %.3f as int %d %d and timestamp delta %.3f deltas casted to uint16_t %d %d %d", point_event.position.x, point_event.position.y, point_event.timestamp, delta_x, delta_y, real_delta_timestamp, static_cast<uint16_t>(delta_x), static_cast<uint16_t>(delta_y), static_cast<uint16_t>(real_delta_timestamp * 9.1f)));
 					}
@@ -897,7 +961,9 @@ PackedByteArray YDrawing::serialize_events(const Vector<DrawingEvent> &events_to
             }
             
             i += point_count + 1; // Skip the points we just serialized and the stroke end event
-            print_line(vformat("Ending stroke, skipping %d points", point_count + 1));
+			if (print_debug) {
+				print_line(vformat("Ending stroke, skipping %d points", point_count + 1));
+			}
         } else if (event.type == CALLBACK_EVENT) {
             offset += encode_uint16(static_cast<uint16_t>(event.position.x), &result.write[offset]);
             offset += encode_uint16(static_cast<uint16_t>(event.position.y), &result.write[offset]);
@@ -925,11 +991,23 @@ bool YDrawing::deserialize_events(const PackedByteArray &data, Vector<DrawingEve
 	uint8_t version = ptr[offset];
 	offset += sizeof(uint8_t);
 
-	if (version != 1) {
+	if (version < 1) {
 		print_line(vformat("Unsupported version: %d", version));
 		return false;
 	}
 
+	bool has_timestamps = true;
+	if (version == 2) {
+		has_timestamps = ptr[offset] == 1;
+		offset += sizeof(uint8_t);
+
+		uint16_t canvas_size_x = decode_uint16(ptr + offset);
+		offset += sizeof(uint16_t);
+		uint16_t canvas_size_y = decode_uint16(ptr + offset);
+		offset += sizeof(uint16_t);
+		// Not using this yet. But I have plans for it in the future.
+		// canvas_size = Vector2i(canvas_size_x, canvas_size_y);
+	}
     // Read color palette
     uint8_t palette_size = ptr[offset];
     offset += sizeof(uint8_t);
@@ -950,6 +1028,7 @@ bool YDrawing::deserialize_events(const PackedByteArray &data, Vector<DrawingEve
 	// print_line(vformat("Reading events"));
     // Read events until finding a 255 byte in place of the event type or end of data
 	bool found_end = false;
+	float fake_timestamp = 0.0f;
     while(!found_end && offset < data.size()) {
 		uint8_t event_type_byte = ptr[offset];
         offset += sizeof(uint8_t);
@@ -963,9 +1042,14 @@ bool YDrawing::deserialize_events(const PackedByteArray &data, Vector<DrawingEve
         DrawingEvent event;
         event.type = static_cast<EventType>(event_type_byte);
 
-		uint16_t scaled_timestamp = decode_uint16(ptr + offset);
-		event.timestamp = static_cast<float>(scaled_timestamp) / 9.1f;
-		offset += sizeof(uint16_t);
+		if (has_timestamps) {
+			uint16_t scaled_timestamp = decode_uint16(ptr + offset);
+			event.timestamp = static_cast<float>(scaled_timestamp) / 9.1f;
+			offset += sizeof(uint16_t);
+		} else {
+			event.timestamp = fake_timestamp;
+			fake_timestamp += 0.01f;
+		}
 
 		// print_line(vformat("Reading event type: %d with timestamp: %.3f uint16_t %d", event.type, event.timestamp, scaled_timestamp));
 
@@ -1013,34 +1097,52 @@ bool YDrawing::deserialize_events(const PackedByteArray &data, Vector<DrawingEve
 					offset += sizeof(int8_t);
 					int8_t delta_y = static_cast<int8_t>(ptr[offset]);
 					offset += sizeof(int8_t);
-					uint8_t delta_timestamp = ptr[offset];
-					offset += sizeof(uint8_t);
 					current_x += delta_x;
 					current_y += delta_y;
-					current_timestamp += static_cast<float>(delta_timestamp) / 900.1f;
+					if (has_timestamps) {
+						uint8_t delta_timestamp = ptr[offset];
+						offset += sizeof(uint8_t);
+						current_timestamp += static_cast<float>(delta_timestamp) / 900.1f;
+					} else {
+						current_timestamp += 0.01f;
+					}
 					// print_line(vformat("Reading delta: %.3f, %.3f, timestamp %.3f as int %d %d and uint16 %d new current int %d %d and timestamp %d", static_cast<float>(current_x), static_cast<float>(current_y), current_timestamp, delta_x, delta_y, delta_timestamp, current_x, current_y, current_timestamp));
 				} else {
 					int16_t delta_x = static_cast<int16_t>(decode_uint16(ptr + offset));
 					offset += sizeof(uint16_t);
 					int16_t delta_y = static_cast<int16_t>(decode_uint16(ptr + offset));
 					offset += sizeof(uint16_t);
-					uint16_t delta_timestamp = decode_uint16(ptr + offset);
-					offset += sizeof(uint16_t);
-					current_x += delta_x;
 					current_y += delta_y;
-					current_timestamp += static_cast<float>(delta_timestamp) / 900.1f;
+					current_x += delta_x;
+					if (has_timestamps) {
+						uint16_t delta_timestamp = decode_uint16(ptr + offset);
+						offset += sizeof(uint16_t);
+						current_timestamp += static_cast<float>(delta_timestamp) / 900.1f;
+					} else {
+						current_timestamp += 0.01f;
+					}
 					// print_line(vformat("Reading delta: %.3f, %.3f, timestamp %.3f as int %d %d and uint16 %d new current int %d %d and timestamp %d", static_cast<float>(current_x), static_cast<float>(current_y), current_timestamp, delta_x, delta_y, delta_timestamp, current_x, current_y, current_timestamp));
 				}
 				point_event.position.x = static_cast<float>(current_x);
 				point_event.position.y = static_cast<float>(current_y);
-				point_event.timestamp = static_cast<float>(current_timestamp);
+				if (has_timestamps) {
+					point_event.timestamp = static_cast<float>(current_timestamp);
+				} else {
+					point_event.timestamp = fake_timestamp;
+					fake_timestamp += 0.01f;
+				}
                 events_destination.push_back(point_event);
             }
             
             // Add stroke end event
             DrawingEvent end_event;
             end_event.type = (event.type == STROKE_START || event.type == STROKE_START_CHANGED) ? STROKE_END : ERASE_END;
-            end_event.timestamp = events_destination[events_destination.size() - 1].timestamp; // Use last point's timestamp
+			if (has_timestamps) {
+				end_event.timestamp = events_destination[events_destination.size() - 1].timestamp; // Use last point's timestamp
+			} else {
+				end_event.timestamp = fake_timestamp;
+				fake_timestamp += 0.01f;
+			}
             events_destination.push_back(end_event);
         } else if (event.type == CALLBACK_EVENT) {
             event.position.x = static_cast<float>(decode_uint16(ptr + offset));
@@ -1061,7 +1163,6 @@ void YDrawing::draw_stroke_incremental(const Vector<Vector2> &smoothing_points) 
     float use_brush_size = current_brush_size;
     if (is_erasing) {
         use_color = background_color;
-        use_brush_size = current_eraser_size;
     }
     float half_width = use_brush_size * 0.5f;
 
@@ -1256,7 +1357,7 @@ void YDrawing::process_playback_events() {
 				start_stroke_custom(event.position, event.color, event.size);
 				break;
 			case ERASE_START_CHANGED:
-				current_eraser_size = event.size;
+				current_brush_size = event.size;
 				start_erase(event.position);
 				break;
             case STROKE_START:
@@ -1324,7 +1425,7 @@ void YDrawing::create_snapshot() {
 		redo_stack.clear();
 	}
 	
-	PackedByteArray snapshot = compress_image(canvas_image);
+	PackedByteArray snapshot = capture_raw_pixels(canvas_image);
 	snapshot_buffer.push_back(snapshot);
 	// print_line(vformat("Created snapshot at index %d", snapshot_buffer.size() - 1));
 	// Add to undo stack
@@ -1338,25 +1439,58 @@ void YDrawing::skip_playback_to_end() {
 }
 
 void YDrawing::apply_snapshot(const PackedByteArray &snapshot) {
-	Ref<Image> restored_image = decompress_image(snapshot);
-	if (restored_image.is_valid()) {
-		canvas_image = restored_image;
-		update_canvas_texture();
-	}
+	restore_raw_pixels(snapshot, canvas_image);
+	update_canvas_texture();
 }
 
-PackedByteArray YDrawing::compress_image(const Ref<Image> &image) {
-	Vector<uint8_t> result = image->save_png_to_buffer();
+PackedByteArray YDrawing::capture_raw_pixels(const Ref<Image> &image) {
+	if (!image.is_valid()) {
+		return PackedByteArray();
+	}
+	
+	// Get the raw image data
+	Vector<uint8_t> raw_data = image->get_data();
+	
+	// For RGB-only, we need 3 bytes per pixel instead of 4 (RGBA8)
+	int pixel_count = image->get_width() * image->get_height();
+	PackedByteArray result;
+	result.resize(pixel_count * 3); // RGB only, no alpha
+	
+	// Extract RGB values from RGBA8 data
+	int offset = 0;
+	for (int i = 0; i < pixel_count; i++) {
+		int src_offset = i * 4; // RGBA8 = 4 bytes per pixel
+		result.write[offset++] = raw_data[src_offset + 0]; // R
+		result.write[offset++] = raw_data[src_offset + 1]; // G
+		result.write[offset++] = raw_data[src_offset + 2]; // B
+		// Skip alpha (src_offset + 3)
+	}
+	
 	return result;
 }
 
-Ref<Image> YDrawing::decompress_image(const PackedByteArray &data) {
-	Ref<Image> image = Image::create_empty(canvas_size.x, canvas_size.y, false, Image::FORMAT_RGBA8);
-	Error err = image->load_png_from_buffer(data);
-	if (err != OK) {
-		print_line(vformat("Error decompressing image: %d", err));
+void YDrawing::restore_raw_pixels(const PackedByteArray &pixel_data, Ref<Image> &image) {
+	if (!image.is_valid() || pixel_data.size() != canvas_size.x * canvas_size.y * 3) {
+		return;
 	}
-	return image;
+	
+	// Create RGBA8 data from RGB data
+	int pixel_count = canvas_size.x * canvas_size.y;
+	Vector<uint8_t> rgba_data;
+	rgba_data.resize(pixel_count * 4); // RGBA8 = 4 bytes per pixel
+	
+	// Convert RGB to RGBA8
+	int offset = 0;
+	for (int i = 0; i < pixel_count; i++) {
+		int dst_offset = i * 4;
+		rgba_data.write[dst_offset + 0] = pixel_data[offset++]; // R
+		rgba_data.write[dst_offset + 1] = pixel_data[offset++]; // G
+		rgba_data.write[dst_offset + 2] = pixel_data[offset++]; // B
+		rgba_data.write[dst_offset + 3] = 255; // Alpha always 255 (1.0)
+	}
+	
+	// Set the image data
+	image->set_data(canvas_size.x, canvas_size.y, false, Image::FORMAT_RGBA8, rgba_data);
 }
 
 bool YDrawing::can_undo() const {
@@ -1456,4 +1590,257 @@ void YDrawing::update_canvas_texture() {
 		canvas_texture->update(canvas_image);
 		queue_redraw();
 	}
+}
+
+Ref<Image> YDrawing::get_canvas_image() const {
+	return canvas_image;
+}
+
+// Static PNG-style compression methods
+PackedByteArray YDrawing::compress_drawing_result(const Ref<Image> &image, int target_width, int target_height, bool run_length_encoding) {
+	if (!image.is_valid()) {
+		return PackedByteArray();
+	}
+	
+	// Resize image to target dimensions if needed
+	Ref<Image> resized_image = image;
+	if (image->get_width() != target_width || image->get_height() != target_height) {
+		resized_image = image->duplicate();
+		resized_image->resize(target_width, target_height, Image::INTERPOLATE_BILINEAR);
+	}
+	
+	// Get raw RGBA data
+	Vector<uint8_t> raw_data = resized_image->get_data();
+	int pixel_count = target_width * target_height;
+	
+	// Create result array with header (width, height, RLE flag) + RGB data
+	PackedByteArray result;
+	result.resize(sizeof(uint16_t) * 2 + sizeof(uint8_t) + pixel_count * 3); // width, height, RLE flag + RGB data
+	
+	int offset = 0;
+	
+	// Write width and height as uint16
+	offset += encode_uint16(static_cast<uint16_t>(target_width), &result.write[offset]);
+	offset += encode_uint16(static_cast<uint16_t>(target_height), &result.write[offset]);
+	
+	// Write RLE flag
+	result.write[offset] = run_length_encoding ? 1 : 0;
+	offset += sizeof(uint8_t);
+	
+	// Apply PNG-style sub filter and store RGB data
+	for (int y = 0; y < target_height; y++) {
+		for (int x = 0; x < target_width; x++) {
+			int pixel_index = y * target_width + x;
+			int src_offset = pixel_index * 4; // RGBA8 = 4 bytes per pixel
+			
+			uint8_t r = raw_data[src_offset + 0];
+			uint8_t g = raw_data[src_offset + 1];
+			uint8_t b = raw_data[src_offset + 2];
+			
+			// Apply sub filter (predict from left pixel)
+			if (x > 0) {
+				int left_pixel_index = y * target_width + (x - 1);
+				int left_src_offset = left_pixel_index * 4;
+				uint8_t left_r = raw_data[left_src_offset + 0];
+				uint8_t left_g = raw_data[left_src_offset + 1];
+				uint8_t left_b = raw_data[left_src_offset + 2];
+				
+				r = (r - left_r) & 0xFF;
+				g = (g - left_g) & 0xFF;
+				b = (b - left_b) & 0xFF;
+			}
+			
+			result.write[offset++] = r;
+			result.write[offset++] = g;
+			result.write[offset++] = b;
+		}
+	}
+	
+	// Apply run-length encoding if requested
+	if (run_length_encoding) {
+		PackedByteArray rle_result;
+		rle_result.resize(sizeof(uint16_t) * 2 + sizeof(uint8_t)); // width, height, RLE flag
+		
+		// Copy header
+		rle_result.write[0] = result[0]; // width low byte
+		rle_result.write[1] = result[1]; // width high byte
+		rle_result.write[2] = result[2]; // height low byte
+		rle_result.write[3] = result[3]; // height high byte
+		rle_result.write[4] = 1; // RLE flag
+		
+		int header_size = sizeof(uint16_t) * 2 + sizeof(uint8_t);
+		int data_start = header_size;
+		
+		// Apply RLE to the filtered RGB data
+		int src_offset = data_start;
+		int total_encoded = 0;
+		
+		while (src_offset < result.size()) {
+			uint8_t current_byte = result[src_offset];
+			int count = 1;
+			
+			// Count consecutive identical bytes
+			while (count < 255 && src_offset + count < result.size() && result[src_offset + count] == current_byte) {
+				count++;
+			}
+			
+			// Ensure we don't exceed the maximum count
+			if (count > 255) {
+				count = 255;
+			}
+			
+
+			
+			if (count >= 3) {
+				// Use RLE encoding: 0xFE followed by count, then byte
+				// Use 0xFE as marker to avoid conflict with 0xFF in data
+				rle_result.append(0xFE);
+				rle_result.append(static_cast<uint8_t>(count));
+				rle_result.append(current_byte);
+				src_offset += count;
+				total_encoded += count;
+				print_line(vformat("RLE encoded: %d bytes of value 0x%02X", count, current_byte));
+			} else {
+				// Use literal encoding: byte as-is
+				rle_result.append(current_byte);
+				src_offset += 1;
+				total_encoded += 1;
+			}
+		}
+		
+		print_line(vformat("RLE compression completed: %d bytes encoded, result size: %d", total_encoded, rle_result.size()));
+		
+		// Validate that we encoded the correct amount of data
+		int expected_encoded = pixel_count * 3;
+		if (total_encoded != expected_encoded) {
+			print_line(vformat("RLE compression size mismatch: expected %d, encoded %d", expected_encoded, total_encoded));
+		}
+		
+		return rle_result;
+	}
+	
+	return result;
+}
+
+Ref<Image> YDrawing::decompress_drawing_result(const PackedByteArray &compressed_data, bool run_length_encoding) {
+	if (compressed_data.size() < sizeof(uint16_t) * 2 + sizeof(uint8_t)) {
+		return Ref<Image>();
+	}
+	
+	const uint8_t *ptr = compressed_data.ptr();
+	int offset = 0;
+	
+	// Read width and height
+	uint16_t width = decode_uint16(ptr + offset);
+	offset += sizeof(uint16_t);
+	uint16_t height = decode_uint16(ptr + offset);
+	offset += sizeof(uint16_t);
+	
+	// Read RLE flag
+	bool uses_rle = ptr[offset] == 1;
+	offset += sizeof(uint8_t);
+	
+	int pixel_count = width * height;
+	
+	// Decompress RLE if needed
+	PackedByteArray decompressed_data;
+	if (uses_rle) {
+		// Decompress RLE data
+		int rle_decompressed_count = 0;
+		while (offset < compressed_data.size()) {
+			uint8_t current_byte = ptr[offset++];
+			
+			if (current_byte == 0xFE && offset + 1 < compressed_data.size()) {
+				// RLE encoded: next byte is count, then the repeated byte
+				uint8_t count = ptr[offset++];
+				if (offset < compressed_data.size()) {
+					uint8_t repeated_byte = ptr[offset++];
+					
+					for (int i = 0; i < count; i++) {
+						decompressed_data.append(repeated_byte);
+						rle_decompressed_count++;
+					}
+				} else {
+					// Malformed RLE data - missing repeated byte
+					print_line("Malformed RLE data - missing repeated byte");
+					return Ref<Image>();
+				}
+			} else {
+				// Literal byte
+				decompressed_data.append(current_byte);
+				rle_decompressed_count++;
+			}
+		}
+		
+		print_line(vformat("RLE decompression completed: %d bytes decompressed", rle_decompressed_count));
+		
+		// Check if we have enough data
+		if (decompressed_data.size() != pixel_count * 3) {
+			print_line(vformat("RLE decompression size mismatch: expected %d, got %d", pixel_count * 3, decompressed_data.size()));
+			return Ref<Image>();
+		}
+	} else {
+		// No RLE, check expected size
+		int expected_size = sizeof(uint16_t) * 2 + sizeof(uint8_t) + pixel_count * 3;
+		if (compressed_data.size() != expected_size) {
+			return Ref<Image>();
+		}
+		
+		// Copy data directly
+		for (int i = offset; i < compressed_data.size(); i++) {
+			decompressed_data.append(ptr[i]);
+		}
+		
+		// Validate the copied data size
+		if (decompressed_data.size() != pixel_count * 3) {
+			print_line(vformat("Non-RLE decompression size mismatch: expected %d, got %d", pixel_count * 3, decompressed_data.size()));
+			return Ref<Image>();
+		}
+	}
+	
+	// Create new image
+	Ref<Image> result = Image::create_empty(width, height, false, Image::FORMAT_RGBA8);
+	Vector<uint8_t> rgba_data;
+	rgba_data.resize(pixel_count * 4); // RGBA8 = 4 bytes per pixel
+	
+	// Decompress RGB data with reverse sub filter
+	int data_offset = 0;
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x++) {
+			// Check if we have enough data to read 3 bytes (RGB)
+			if (data_offset + 2 >= decompressed_data.size()) {
+				return Ref<Image>(); // Not enough data
+			}
+			
+			int pixel_index = y * width + x;
+			int dst_offset = pixel_index * 4;
+			
+			uint8_t r = decompressed_data[data_offset++];
+			uint8_t g = decompressed_data[data_offset++];
+			uint8_t b = decompressed_data[data_offset++];
+			
+			// Reverse sub filter
+			if (x > 0) {
+				int left_pixel_index = y * width + (x - 1);
+				int left_dst_offset = left_pixel_index * 4;
+				uint8_t left_r = rgba_data[left_dst_offset + 0];
+				uint8_t left_g = rgba_data[left_dst_offset + 1];
+				uint8_t left_b = rgba_data[left_dst_offset + 2];
+				
+				r = (r + left_r) & 0xFF;
+				g = (g + left_g) & 0xFF;
+				b = (b + left_b) & 0xFF;
+			}
+			
+			rgba_data.write[dst_offset + 0] = r;
+			rgba_data.write[dst_offset + 1] = g;
+			rgba_data.write[dst_offset + 2] = b;
+			rgba_data.write[dst_offset + 3] = 255; // Alpha always 255 (1.0)
+		}
+	}
+	
+	// Set the image data
+	result->set_data(width, height, false, Image::FORMAT_RGBA8, rgba_data);
+	
+	return result;
 }
