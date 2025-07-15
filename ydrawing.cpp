@@ -1621,161 +1621,177 @@ PackedByteArray YDrawing::compress_drawing_result(const Ref<Image> &image, int t
 	Vector<uint8_t> raw_data = resized_image->get_data();
 	int pixel_count = target_width * target_height;
 	
-	// Create result array with header (width, height, RLE flag) + RGB data
-	PackedByteArray result;
-	result.resize(sizeof(uint16_t) * 2 + sizeof(uint8_t) + pixel_count * 3); // width, height, RLE flag + RGB data
+	Vector<DrawingColor> palette;
+	Vector<uint8_t> pixel_to_palette_index;
+	pixel_to_palette_index.resize(target_width * target_height);
+	HashMap<DrawingColor, uint8_t, ColorHash> palette_index_map;
 	
-	int offset = 0;
-	
-	// Write width and height as uint16
-	offset += encode_uint16(static_cast<uint16_t>(target_width), &result.write[offset]);
-	offset += encode_uint16(static_cast<uint16_t>(target_height), &result.write[offset]);
-	
-	// Write RLE flag
-	result.write[offset] = run_length_encoding ? 1 : 0;
-	offset += sizeof(uint8_t);
-	
-	// Apply PNG-style sub filter and store RGB data
-	for (int y = 0; y < target_height; y++) {
-		for (int x = 0; x < target_width; x++) {
-			int pixel_index = y * target_width + x;
-			int src_offset = pixel_index * 4; // RGBA8 = 4 bytes per pixel
-			
-			uint8_t r = raw_data[src_offset + 0];
-			uint8_t g = raw_data[src_offset + 1];
-			uint8_t b = raw_data[src_offset + 2];
-			
-			// Apply sub filter (predict from left pixel)
-			if (x > 0) {
-				int left_pixel_index = y * target_width + (x - 1);
-				int left_src_offset = left_pixel_index * 4;
-				uint8_t left_r = raw_data[left_src_offset + 0];
-				uint8_t left_g = raw_data[left_src_offset + 1];
-				uint8_t left_b = raw_data[left_src_offset + 2];
-				
-				r = (r - left_r) & 0xFF;
-				g = (g - left_g) & 0xFF;
-				b = (b - left_b) & 0xFF;
-			}
-			
-			result.write[offset++] = r;
-			result.write[offset++] = g;
-			result.write[offset++] = b;
-		}
-	}
+	// First pass: build palette with similarity merging
+    for (int y = 0; y < target_height; y++) {
+        for (int x = 0; x < target_width; x++) {
+            int pixel_index = y * target_width + x;
+            int src_offset = pixel_index * 4;
+            
+            uint8_t r = raw_data[src_offset + 0];
+            uint8_t g = raw_data[src_offset + 1];
+            uint8_t b = raw_data[src_offset + 2];
+            
+            DrawingColor current_color = {r, g, b};
+            
+            // Check if we already have this exact color
+            if (palette_index_map.has(current_color)) {
+                pixel_to_palette_index.write[pixel_index] = palette_index_map.get(current_color);
+                continue;
+            }
+
+            // Check if we have a similar color within threshold
+            int similar_index = find_similar_color_fast(palette, current_color, 10);
+            if (similar_index >= 0) {
+                pixel_to_palette_index.write[pixel_index] = similar_index;
+                palette_index_map[current_color] = similar_index;
+            } else {
+                // Add new color to palette
+                if (palette.size() >= 255) {
+                    // Palette full, find closest existing color
+                    int closest_index = 0;
+                    int min_distance = manhattan_distance(palette[0], current_color);
+                    for (int i = 1; i < palette.size(); i++) {
+                        int dist = manhattan_distance(palette[i], current_color);
+                        if (dist < min_distance) {
+                            min_distance = dist;
+                            closest_index = i;
+                        }
+                    }
+                    pixel_to_palette_index.write[pixel_index] = closest_index;
+                    palette_index_map[current_color] = closest_index;
+                } else {
+                    uint8_t new_index = palette.size();
+                    palette.push_back(current_color);
+                    pixel_to_palette_index.write[pixel_index] = new_index;
+                    palette_index_map[current_color] = new_index;
+                }
+            }
+        }
+    }
+
 	// Apply run-length encoding if requested
 	if (run_length_encoding) {
 		PackedByteArray rle_result;
-    
-		// Reserve space for header: width (2 bytes) + height (2 bytes) + RLE flag (1 byte)
-		rle_result.resize(sizeof(uint16_t) * 2 + sizeof(uint8_t));
+
+		// Reserve space for header
+		rle_result.resize(sizeof(uint16_t) * 2 + sizeof(uint8_t) * (1 + 1 + (palette.size() * 3)));
+		int offset = 0;
 		
-		// HEADER CONSTRUCTION: Same as before
-		rle_result.write[0] = result[0]; // width low byte
-		rle_result.write[1] = result[1]; // width high byte
-		rle_result.write[2] = result[2]; // height low byte
-		rle_result.write[3] = result[3]; // height high byte
-		rle_result.write[4] = 1; // RLE flag
+		// HEADER CONSTRUCTION
+		offset += encode_uint16(static_cast<uint16_t>(target_width), &rle_result.write[offset]);
+		offset += encode_uint16(static_cast<uint16_t>(target_height), &rle_result.write[offset]);
+		rle_result.write[offset++] = 1; // RLE flag
+		rle_result.write[offset++] = palette.size();
+		for (int i = 0; i < palette.size(); i++) {
+			rle_result.write[offset++] = palette[i].r;
+			rle_result.write[offset++] = palette[i].g;
+			rle_result.write[offset++] = palette[i].b;
+		}
 		
-		int header_size = sizeof(uint16_t) * 2 + sizeof(uint8_t);
-		int data_start = header_size;
+		// COMPRESSION MAIN LOOP
+		int src_offset = 0;
+		int chunk_count = 0;
 		
-		// COMPRESSION MAIN LOOP:
-		int src_offset = data_start;
-		int total_encoded = 0;
-		
-		while (src_offset < result.size()) {
-			uint8_t current_byte = result[src_offset];
+		while (src_offset < pixel_to_palette_index.size()) {
+			uint8_t current_byte = pixel_to_palette_index[src_offset];
 			int run_count = 1;
 			
-			// COUNT CONSECUTIVE IDENTICAL BYTES:
-			// Look ahead to see how many times this byte repeats
-			while (run_count < 255 &&                           // Don't exceed byte limit
-				src_offset + run_count < result.size() &&    // Don't go past end
-				result[src_offset + run_count] == current_byte) {
+			// COUNT CONSECUTIVE IDENTICAL BYTES
+			while (run_count < 255 &&
+				src_offset + run_count < pixel_to_palette_index.size() &&
+				pixel_to_palette_index[src_offset + run_count] == current_byte) {
 				run_count++;
 			}
 			
-			// ENCODING DECISION:
-			// Use RLE if we have 3+ identical bytes, otherwise use literal encoding
 			if (run_count >= 3) {
-				// RLE ENCODING: [2][count][repeated_value]				
-				rle_result.append(2);                           // Type: RLE data
-				rle_result.append(static_cast<uint8_t>(run_count)); // How many repetitions
-				rle_result.append(current_byte);                // The repeated byte
+				// RLE ENCODING				
+				rle_result.append(2);
+				rle_result.append(static_cast<uint8_t>(run_count));
+				rle_result.append(current_byte);
 				
-				src_offset += run_count;    // Skip all the repeated bytes
-				total_encoded += run_count;
-				
+				src_offset += run_count;				
 			} else {
-				// LITERAL ENCODING: [1][count][byte1][byte2]...[byteN]
-				// We found a run that's too short for RLE, so let's look ahead to see
-				// how many more non-repeating or short-repeating bytes we can group together
-				
+				// LITERAL ENCODING
 				int literal_start = src_offset;
 				int literal_count = 0;
-				
-				// LITERAL GROUPING LOOP:
-				// Keep adding bytes to our literal group until we find a good RLE opportunity
-				while (literal_count < 255 && src_offset < result.size()) {
-					current_byte = result[src_offset];
+
+				while (literal_count < 255 && src_offset < pixel_to_palette_index.size()) {
+					current_byte = pixel_to_palette_index[src_offset];
 					run_count = 1;
 					
-					// Check how many times this byte repeats
 					while (run_count < 255 &&
-						src_offset + run_count < result.size() &&
-						result[src_offset + run_count] == current_byte) {
+						src_offset + run_count < pixel_to_palette_index.size() &&
+						pixel_to_palette_index[src_offset + run_count] == current_byte) {
 						run_count++;
 					}
 					
-					// If we found a good RLE opportunity (3+ repeats), stop literal grouping
 					if (run_count >= 3) {
 						break;
 					}
 					
-					// Otherwise, add this byte (and any short runs) to our literal group
-					int bytes_to_add = run_count;
-					// Make sure we don't exceed the 255 byte limit for literal groups
-					if (literal_count + bytes_to_add > 255) {
-						bytes_to_add = 255 - literal_count;
-					}
-					
+					int bytes_to_add = std::min(run_count, 255 - literal_count);
 					literal_count += bytes_to_add;
 					src_offset += bytes_to_add;
 					
-					// If we've reached the literal group size limit, stop
 					if (literal_count >= 255) {
 						break;
 					}
 				}
 				
-				// WRITE LITERAL GROUP: [1][count][data...]
-				rle_result.append(1);                           // Type: Literal data
-				rle_result.append(static_cast<uint8_t>(literal_count)); // How many bytes
+				rle_result.append(1);
+				rle_result.append(static_cast<uint8_t>(literal_count));
 				
-				// Copy all the literal bytes
 				for (int i = 0; i < literal_count; i++) {
-					rle_result.append(result[literal_start + i]);
+					rle_result.append(pixel_to_palette_index[literal_start + i]);
 				}
-				
-				total_encoded += literal_count;
 			}
-		}
 		
-		// print_line(vformat("RLE compression completed: %d bytes encoded, result size: %d", 
-						// total_encoded, rle_result.size()));
-		
-		// VALIDATION:
-		int expected_encoded = pixel_count * 3;
-		if (total_encoded != expected_encoded) {
-			print_line(vformat("RLE compression size mismatch: expected %d, encoded %d", 
-							expected_encoded, total_encoded));
+			chunk_count++;
+			
+			// Safety check to prevent infinite loops
+			if (chunk_count > 10000) {
+				break;
+			}
 		}
 		
 		return rle_result;
 	}
-	
-	return result;
+	else {
+		// Create result array with header (width, height, RLE flag) + RGB data
+		PackedByteArray result;
+		result.resize(sizeof(uint16_t) * 2 + sizeof(uint8_t) * 2 + pixel_count); // width, height, palette size, RLE flag + pixels index data
+		
+		int offset = 0;
+		
+		// Write width and height as uint16
+		offset += encode_uint16(static_cast<uint16_t>(target_width), &result.write[offset]);
+		offset += encode_uint16(static_cast<uint16_t>(target_height), &result.write[offset]);
+		
+		// Write RLE flag
+		result.write[offset++] = 0;
+
+		// Write palette to result
+		result.write[offset++] = palette.size();
+		for (int i = 0; i < palette.size(); i++) {
+			result.write[offset++] = palette[i].r;
+			result.write[offset++] = palette[i].g;
+			result.write[offset++] = palette[i].b;
+		}
+
+		// Write pixel_to_palette_index to result
+		offset += encode_uint16(static_cast<uint16_t>(pixel_to_palette_index.size()), &result.write[offset]);
+		// Write pixel_to_palette_index to result
+		for (int i = 0; i < pixel_to_palette_index.size(); i++) {
+			result.write[offset++] = pixel_to_palette_index[i];
+		}
+
+		return result;
+	}
 }
 
 Ref<Image> YDrawing::decompress_drawing_result(const PackedByteArray &compressed_data, bool run_length_encoding) {
@@ -1793,97 +1809,77 @@ Ref<Image> YDrawing::decompress_drawing_result(const PackedByteArray &compressed
 	offset += sizeof(uint16_t);
 	
 	// Read RLE flag
-	bool uses_rle = ptr[offset] == 1;
-	offset += sizeof(uint8_t);
+	bool uses_rle = ptr[offset++] == 1;
+	
+	// Read palette size
+	uint8_t palette_size = ptr[offset++];
+	
+	// Read palette
+	Vector<DrawingColor> palette;
+	for (int i = 0; i < palette_size; i++) {
+		DrawingColor color = {ptr[offset++], ptr[offset++], ptr[offset++]};
+		palette.push_back(color);
+	}
 	
 	int pixel_count = width * height;
 	
 	// Decompress RLE if needed
 	PackedByteArray decompressed_data;
-	if (uses_rle) {
-		/*
-		* NEW RLE DECODING PROCESS:
-		* 
-		* Our new format uses structured chunks: [TYPE][COUNT][DATA...]
-		* - TYPE 1 = Literal data (read COUNT bytes as-is)
-		* - TYPE 2 = RLE data (read 1 byte, repeat it COUNT times)
-		* 
-		* This is much simpler than the old escape-sequence approach!
-		*/
-		
+
+	if (uses_rle) {    
 		int rle_decompressed_count = 0;
 		
-		// Process all chunks until we've read all compressed data
 		while (offset < compressed_data.size()) {
-			
-			// SAFETY CHECK: Make sure we have at least TYPE and COUNT bytes
 			if (offset + 1 >= compressed_data.size()) {
-				print_line("Malformed RLE data - missing TYPE or COUNT byte");
-				return Ref<Image>();
+				break;
 			}
 			
-			// Read the chunk header
-			uint8_t chunk_type = ptr[offset++];  // 1 = literal, 2 = RLE
-			uint8_t chunk_count = ptr[offset++]; // How many bytes/repetitions
-
+			uint8_t chunk_type = ptr[offset++];
+			uint8_t chunk_count = ptr[offset++];
+			
 			if (chunk_type == 1) {
-				// LITERAL CHUNK: [1][count][byte1][byte2]...[byteN]
-				// Read COUNT bytes and store them as-is
-				
-				// Safety check: make sure we have enough data
+				// LITERAL CHUNK
 				if (offset + chunk_count > compressed_data.size()) {
-					print_line(vformat("Malformed RLE data - literal chunk needs %d bytes but only %d available", 
+					print_line(vformat("ERROR: Literal chunk needs %d bytes but only %d available", 
 									chunk_count, compressed_data.size() - offset));
 					return Ref<Image>();
 				}
 				
-				// Copy all literal bytes
 				for (int i = 0; i < chunk_count; i++) {
 					decompressed_data.append(ptr[offset++]);
 					rle_decompressed_count++;
-				}				
-			} else if (chunk_type == 2) {
-				// RLE CHUNK: [2][count][repeated_byte_value]
-				// Read 1 byte and repeat it COUNT times
+				}
 				
-				// Safety check: make sure we have the repeated byte
+			} else if (chunk_type == 2) {
+				// RLE CHUNK
 				if (offset >= compressed_data.size()) {
-					print_line("Malformed RLE data - missing repeated byte value");
+					print_line("ERROR: Missing repeated byte value");
 					return Ref<Image>();
 				}
 				
 				uint8_t repeated_byte = ptr[offset++];
 				
-				// Output the byte COUNT times
 				for (int i = 0; i < chunk_count; i++) {
+					if (rle_decompressed_count >= pixel_count) {
+						print_line(vformat("ERROR: RLE would exceed pixel_count at i=%d", i));
+						break;
+					}
 					decompressed_data.append(repeated_byte);
 					rle_decompressed_count++;
-				}				
+				}
 			} else {
-				// UNKNOWN CHUNK TYPE: This shouldn't happen with valid data
-				print_line(vformat("Unknown RLE chunk type: %d", chunk_type));
+				print_line(vformat("ERROR: Unknown chunk type %d", chunk_type));
 				return Ref<Image>();
 			}
-			
-			// SAFETY CHECK: Prevent infinite loops or memory issues
-			// If we've already decompressed more data than expected, something is wrong
-			if (rle_decompressed_count > pixel_count * 3) {
-				print_line(vformat("RLE decompression exceeded expected size: %d > %d", 
-								rle_decompressed_count, pixel_count * 3));
-				return Ref<Image>();
+						
+			if (rle_decompressed_count >= pixel_count) {
+				break;
 			}
 		}
 		
-		// print_line(vformat("RLE decompression completed: %d bytes decompressed", rle_decompressed_count));
 		
-		// FINAL VALIDATION: Check if we have exactly the right amount of data
-		if (decompressed_data.size() != pixel_count * 3) {
-			print_line(vformat("RLE decompression size mismatch: expected %d, got %d", 
-							pixel_count * 3, decompressed_data.size()));
-			return Ref<Image>();
-		}
-		
-	}  else {
+	}
+  else {
 		// No RLE, check expected size
 		int expected_size = sizeof(uint16_t) * 2 + sizeof(uint8_t) + pixel_count * 3;
 		if (compressed_data.size() != expected_size) {
@@ -1902,49 +1898,84 @@ Ref<Image> YDrawing::decompress_drawing_result(const PackedByteArray &compressed
 		}
 	}
 	
-	// Create new image
 	Ref<Image> result = Image::create_empty(width, height, false, Image::FORMAT_RGBA8);
 	Vector<uint8_t> rgba_data;
 	rgba_data.resize(pixel_count * 4); // RGBA8 = 4 bytes per pixel
 	
-	// Decompress RGB data with reverse sub filter
-	int data_offset = 0;
-	for (int y = 0; y < height; y++) {
-		for (int x = 0; x < width; x++) {
-			// Check if we have enough data to read 3 bytes (RGB)
-			if (data_offset + 2 >= decompressed_data.size()) {
-				return Ref<Image>(); // Not enough data
-			}
+	for (int i = 0; i < decompressed_data.size(); i++) {
+		rgba_data.write[i * 4 + 0] = palette[decompressed_data[i]].r;
+		rgba_data.write[i * 4 + 1] = palette[decompressed_data[i]].g;
+		rgba_data.write[i * 4 + 2] = palette[decompressed_data[i]].b;
+		rgba_data.write[i * 4 + 3] = 255; // Alpha always 255 (1.0)
+	}
+		
+	// Apply antialiasing filter
+	Vector<uint8_t> smoothed_data = rgba_data; // Copy original data
+	
+	for (int y = 1; y < height - 1; y++) {
+		for (int x = 1; x < width - 1; x++) {
+			int center_idx = y * width + x;
+			uint8_t center_palette_idx = decompressed_data[center_idx];
 			
-			int pixel_index = y * width + x;
-			int dst_offset = pixel_index * 4;
+			// Check if this pixel is on an edge (has different colored neighbors)
+			int diff_neighbors = 0;
 			
-			uint8_t r = decompressed_data[data_offset++];
-			uint8_t g = decompressed_data[data_offset++];
-			uint8_t b = decompressed_data[data_offset++];
+			// Check 4-connected neighbors
+			if (decompressed_data[center_idx - 1] != center_palette_idx) diff_neighbors++; // left
+			if (decompressed_data[center_idx + 1] != center_palette_idx) diff_neighbors++; // right
+			if (decompressed_data[center_idx - width] != center_palette_idx) diff_neighbors++; // up
+			if (decompressed_data[center_idx + width] != center_palette_idx) diff_neighbors++; // down
 			
-			// Reverse sub filter
-			if (x > 0) {
-				int left_pixel_index = y * width + (x - 1);
-				int left_dst_offset = left_pixel_index * 4;
-				uint8_t left_r = rgba_data[left_dst_offset + 0];
-				uint8_t left_g = rgba_data[left_dst_offset + 1];
-				uint8_t left_b = rgba_data[left_dst_offset + 2];
+			// Only smooth pixels that are on edges
+			if (diff_neighbors > 0) {
+				float total_r = 0, total_g = 0, total_b = 0;
+				float total_weight = 0;
 				
-				r = (r + left_r) & 0xFF;
-				g = (g + left_g) & 0xFF;
-				b = (b + left_b) & 0xFF;
+				// 3x3 kernel with center weight
+				for (int dy = -1; dy <= 1; dy++) {
+					for (int dx = -1; dx <= 1; dx++) {
+						int nx = x + dx;
+						int ny = y + dy;
+						int neighbor_idx = ny * width + nx;
+						
+						// Weight: center gets more weight, edges get less
+						float weight = (dx == 0 && dy == 0) ? 2.0f : 1.0f;
+						
+						// Reduce weight for very different colors
+						uint8_t neighbor_palette_idx = decompressed_data[neighbor_idx];
+						if (neighbor_palette_idx != center_palette_idx) {
+							// Calculate color difference
+							DrawingColor center_color = palette[center_palette_idx];
+							DrawingColor neighbor_color = palette[neighbor_palette_idx];
+							
+							int color_diff = abs(center_color.r - neighbor_color.r) + 
+										abs(center_color.g - neighbor_color.g) + 
+										abs(center_color.b - neighbor_color.b);
+							
+							// Reduce weight for very different colors
+							if (color_diff > 150) weight *= 0.2f;
+							else if (color_diff > 100) weight *= 0.5f;
+							else weight *= 0.8f;
+						}
+						
+						total_r += palette[neighbor_palette_idx].r * weight;
+						total_g += palette[neighbor_palette_idx].g * weight;
+						total_b += palette[neighbor_palette_idx].b * weight;
+						total_weight += weight;
+					}
+				}
+				
+				// Apply smoothed color
+				int rgba_idx = center_idx * 4;
+				smoothed_data.write[rgba_idx + 0] = (uint8_t)(total_r / total_weight);
+				smoothed_data.write[rgba_idx + 1] = (uint8_t)(total_g / total_weight);
+				smoothed_data.write[rgba_idx + 2] = (uint8_t)(total_b / total_weight);
 			}
-			
-			rgba_data.write[dst_offset + 0] = r;
-			rgba_data.write[dst_offset + 1] = g;
-			rgba_data.write[dst_offset + 2] = b;
-			rgba_data.write[dst_offset + 3] = 255; // Alpha always 255 (1.0)
 		}
 	}
 	
 	// Set the image data
-	result->set_data(width, height, false, Image::FORMAT_RGBA8, rgba_data);
+	result->set_data(width, height, false, Image::FORMAT_RGBA8, smoothed_data);
 	
 	return result;
 }

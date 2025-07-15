@@ -20,6 +20,23 @@ class YDrawing : public Control {
 	GDCLASS(YDrawing, Control);
 
 public:
+
+	struct DrawingColor {
+		uint8_t r, g, b;
+		
+		bool operator==(const DrawingColor& other) const {
+			return r == other.r && g == other.g && b == other.b;
+		}
+	};
+	
+	struct ColorHash {
+		static uint32_t hash(const DrawingColor& c) {
+			return (static_cast<uint32_t>(c.r) << 16) | 
+				(static_cast<uint32_t>(c.g) << 8) | 
+				static_cast<uint32_t>(c.b); 
+		}
+	};
+
 	TextureRect::ExpandMode expand_mode = TextureRect::EXPAND_KEEP_SIZE;
 	TextureRect::StretchMode stretch_mode = TextureRect::STRETCH_SCALE;
 
@@ -258,6 +275,19 @@ public:
 	bool prevent_record_snapshots = false;
 	
 	Ref<Image> get_canvas_image() const;
+
+	static inline int manhattan_distance(const DrawingColor& a, const DrawingColor& b) {
+		return abs(a.r - b.r) + abs(a.g - b.g) + abs(a.b - b.b);
+	}
+
+	static int find_similar_color_fast(const Vector<DrawingColor>& palette, const DrawingColor& color, int threshold = 10) {
+		for (int i = 0; i < palette.size(); i++) {
+			if (manhattan_distance(palette[i], color) < threshold) {
+				return i;
+			}
+		}
+		return -1;
+	}
 
 	// Undo/Redo
 	void undo();
